@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "id": "pinta365.ovpn",
+  "name": "OVPN",
+  "version": "0.1.0",
+  "author": "Pinta365",
+  "license": "MIT",
+  "description": "OVPN.com VPN in the Omarchy bar: one-click connect, location list with ping and load, favorites, UDP/TCP, auto-connect.",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "OVPN",
+    "description": "Connect to OVPN locations through NetworkManager, with live status in the bar.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showLocationText": true,
+      "autoConnect": false,
+      "autoConnectTarget": "Last used",
+      "notifyOnDrop": true,
+      "pingIntervalSec": 60
+    },
+    "schema": [
+      {
+        "key": "showLocationText",
+        "type": "boolean",
+        "label": "Show the connected city next to the icon",
+        "defaultValue": true
+      },
+      {
+        "key": "autoConnect",
+        "type": "boolean",
+        "label": "Connect automatically when the shell starts",
+        "description": "Needs a remembered password.",
+        "defaultValue": false
+      },
+      {
+        "key": "autoConnectTarget",
+        "type": "enum",
+        "label": "Auto-connect to",
+        "options": [
+          "Last used",
+          "Fastest",
+          "First favorite"
+        ],
+        "defaultValue": "Last used"
+      },
+      {
+        "key": "notifyOnDrop",
+        "type": "boolean",
+        "label": "Notify when the tunnel drops unexpectedly",
+        "defaultValue": true
+      },
+      {
+        "key": "pingIntervalSec",
+        "type": "integer",
+        "label": "Ping refresh while the panel is open (seconds)",
+        "min": 15,
+        "max": 600,
+        "step": 15,
+        "defaultValue": 60
+      }
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local development only: tools/reload.sh syncs the tree into the shell,
+# knowledge/ is the lab notebook (roadmap, findings) shared between agents.
+# Durable facts belong in README.md instead.
+tools/
+knowledge/
+
+# Editor / agent / OS clutter
+.claude/
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
