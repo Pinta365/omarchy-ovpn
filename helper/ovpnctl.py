@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,11 @@ PORTS = {"udp": [1194, 1195], "tcp": [443]}
 DATA_CIPHERS = "CHACHA20-POLY1305:AES-256-GCM:AES-256-CBC:AES-128-GCM"
 
 KEYRING_SCHEMA_NAME = "se.ovpn.omarchy"
+
+# Installed by networkmanager-openvpn, which Omarchy does not ship.
+NM_OPENVPN_MARKER = os.environ.get(
+    "OVPN_OMARCHY_NM_OPENVPN", "/usr/lib/NetworkManager/VPN/nm-openvpn-service.name"
+)
 
 
 class HelperError(Exception):
@@ -119,7 +125,7 @@ def fetch_entry(refresh=False):
     except HelperError:
         if cached is not None:
             return cached, True
-        raise
+        raise HelperError("Can't reach OVPN to load locations. Check your internet connection.")
 
     os.makedirs(CACHE_DIR, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix=".entry.")
@@ -423,6 +429,7 @@ def status_payload(with_ip=False):
         "tunnelAddress": address,
         "username": state.get("username") or "",
         "hasPassword": bool(keyring_lookup(state.get("username"))),
+        "openvpnSupport": os.path.isfile(NM_OPENVPN_MARKER),
         "favorites": state.get("favorites") or [],
         "preferredProtocol": state.get("protocol") or "udp",
         "preferredVia": state.get("via") or None,
@@ -483,6 +490,8 @@ def cmd_logout(args):
 
 
 def cmd_connect(args):
+    if not os.path.isfile(NM_OPENVPN_MARKER):
+        fail("networkmanager-openvpn is not installed", missingOpenvpn=True)
     if not (os.path.isfile(CA_FILE) and os.path.isfile(TA_FILE)):
         raise HelperError("CA or tls-auth file missing from %s" % ASSETS)
 
@@ -574,6 +583,24 @@ def cmd_favorite(args):
     emit({"ok": True, "favorites": favorites})
 
 
+def cmd_uninstall(args):
+    """Remove everything the plugin created outside its own folder."""
+    removed = []
+    if active_details() is not None:
+        nmcli(["connection", "down", "id", PROFILE], timeout=30)
+    if profile_exists() and nmcli(["connection", "delete", "id", PROFILE]).returncode == 0:
+        removed.append("NetworkManager profile '%s'" % PROFILE)
+    username = load_state().get("username")
+    if username and keyring_lookup(username):
+        keyring_clear(username)
+        removed.append("keyring entry for %s" % username)
+    for path in (STATE_DIR, CACHE_DIR):
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+            removed.append(path)
+    emit({"ok": True, "removed": removed})
+
+
 def cmd_watch(args):
     """Print status on each NetworkManager change, coalescing bursts."""
     import select
@@ -631,6 +658,9 @@ def main():
     p.set_defaults(func=cmd_connect)
 
     sub.add_parser("disconnect", help="disconnect").set_defaults(func=cmd_disconnect)
+    sub.add_parser(
+        "uninstall", help="remove the NM profile, keyring entry, state and cache"
+    ).set_defaults(func=cmd_uninstall)
 
     p = sub.add_parser("protocol", help="save the preferred protocol")
     p.add_argument("proto", choices=["udp", "tcp"])

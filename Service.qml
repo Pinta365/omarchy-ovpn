@@ -11,6 +11,8 @@ Item {
   property var shell: null
   // Pushed in by the widgets; services get no settings of their own.
   property var settings: ({})
+  property bool settingsReady: false
+  onSettingsChanged: settingsReady = true
   property int openPanels: 0
   readonly property bool panelOpen: openPanels > 0
 
@@ -35,6 +37,8 @@ Item {
   readonly property bool busy: Model.isBusy(state) || actionProcess.running
   readonly property bool signedIn: String(status.username || "") !== ""
   readonly property bool canConnect: signedIn && (status.hasPassword || sessionPassword !== "")
+  readonly property bool openvpnMissing: everLoaded && status.openvpnSupport === false
+  property bool installing: false
   // Multihop is UDP only, so it overrides the protocol preference.
   readonly property string multihopEntry: status.preferredVia || ""
   readonly property bool multihop: multihopEntry !== ""
@@ -130,7 +134,7 @@ Item {
   }
 
   function connectTo(slug) {
-    if (actionProcess.running) return
+    if (actionProcess.running || openvpnMissing) return
     var target = resolveTarget(slug, multihopEntry)
     if (target === "") { lastError = "No locations loaded yet"; return }
     if (multihop && target === multihopEntry) {
@@ -169,6 +173,13 @@ Item {
     disconnectProcess.running = true
   }
 
+  // Runs in a terminal so the package manager can ask for the password there.
+  function installOpenvpn() {
+    installing = true
+    Quickshell.execDetached(["xdg-terminal-exec", "--", "bash", "-c",
+      "omarchy pkg add networkmanager-openvpn; echo; read -rsn1 -p 'Press any key to close.'"])
+  }
+
   function quickToggle() {
     if (connected || state === Model.STATE_CONNECTING) disconnect()
     else connectTo(status.last || Model.FASTEST)
@@ -185,6 +196,7 @@ Item {
   }
 
   function signOut() {
+    if (state !== Model.STATE_OFF) disconnect()
     sessionPassword = ""
     runAction("logout", ["logout"], "{}", 20)
   }
@@ -254,9 +266,9 @@ Item {
   }
 
   function maybeAutoConnect() {
-    if (autoConnectDone || !everLoaded || locations.length === 0) return
+    if (autoConnectDone || !everLoaded || !settingsReady || locations.length === 0) return
     autoConnectDone = true
-    if (!autoConnect || state !== Model.STATE_OFF || !canConnect) return
+    if (!autoConnect || state !== Model.STATE_OFF || !canConnect || openvpnMissing) return
     var target = Model.FASTEST
     if (autoConnectTarget === "Last used" && status.last) target = status.last
     else if (autoConnectTarget === "First favorite" && (status.favorites || []).length > 0) target = status.favorites[0]
@@ -298,6 +310,13 @@ Item {
       var idle = Object.assign({}, status)
       idle.state = Model.STATE_OFF
       status = idle
+      return
+    }
+    if (parsed.missingOpenvpn) {
+      var missing = Object.assign({}, status)
+      missing.openvpnSupport = false
+      missing.state = Model.STATE_OFF
+      status = missing
       return
     }
     if (parsed.authFailed || parsed.needsPassword || parsed.needsLogin) {
@@ -364,6 +383,7 @@ Item {
     onExited: {
       var parsed = Model.parse(serversOut.text)
       if (parsed && parsed.ok && parsed.datacenters) {
+        if (root.locations.length === 0 && root.lastError.indexOf("load locations") >= 0) root.lastError = ""
         root.locations = parsed.datacenters
         root.maybeAutoConnect()
       } else if (parsed && parsed.error) {
@@ -387,6 +407,7 @@ Item {
     onExited: {
       var parsed = Model.parse(ipOut.text)
       if (!parsed || !parsed.ok) return
+      root.applyStatus(parsed)
       root.publicIp = parsed.ip || ""
       root.publicProtected = parsed.protected === true
     }
@@ -406,6 +427,15 @@ Item {
   Process { id: multihopProcess }
   Process { id: protocolProcess }
 
+  Timer {
+    interval: 3000
+    repeat: true
+    running: root.installing && root.openvpnMissing
+    onTriggered: root.lookupIp()
+  }
+
+  onOpenvpnMissingChanged: if (!openvpnMissing) installing = false
+
   // Routes settle shortly after NetworkManager reports the change.
   Timer {
     id: ipDelay
@@ -418,6 +448,13 @@ Item {
     running: root.panelOpen
     repeat: true
     onTriggered: root.ping()
+  }
+
+  Timer {
+    interval: 30000
+    repeat: true
+    running: root.locations.length === 0
+    onTriggered: root.loadServers(false)
   }
 
   // Keep load figures fresh for the fastest pick.
