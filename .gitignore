@@ -15,3 +15,14 @@ knowledge/
 *.swp
 *~
 .DS_Store
+
+# Files coding agents load on their own. `omarchy plugin add` clones the whole
+# repo into users' plugin folders, so these must never ship; they stay local.
+AGENTS.md
+CLAUDE.md
+CLAUDE.local.md
+GEMINI.md
+.cursorrules
+.windsurfrules
+.clinerules
+.cursor/
