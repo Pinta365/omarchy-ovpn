@@ -17,6 +17,18 @@ Requirements: `networkmanager-openvpn`, which a stock Omarchy install does not
 include. Everything else it uses (NetworkManager, `gnome-keyring`, `libsecret`,
 `python-gobject`, `iputils`) ships with Omarchy.
 
+## Remove
+
+```bash
+~/.config/omarchy/plugins/pinta365.ovpn/helper/ovpnctl.py uninstall
+omarchy plugin remove pinta365.ovpn
+```
+
+The first command disconnects and deletes what the plugin created outside its
+folder: the `OVPN (Omarchy)` NetworkManager profile, the remembered password
+in your keyring, and `~/.local/state/ovpn-omarchy` and `~/.cache/ovpn-omarchy`.
+Your own NetworkManager connections are never touched.
+
 ## Using it
 
 - Click the shield to open the panel; middle-click connects to the last
