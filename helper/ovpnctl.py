@@ -22,7 +22,10 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 API = "https://www.ovpn.com/v2/api/client"
+KEYS_API = "https://www.ovpn.com/v4/api/keys"
 PROFILE = "OVPN (Omarchy)"
+PROFILE_WG = "OVPN (Omarchy) WG"
+WG_IFNAME = "ovpn-wg"
 USER_AGENT = "omarchy-ovpn/0.1"
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -41,6 +44,11 @@ PORTS = {"udp": [1194, 1195], "tcp": [443]}
 DATA_CIPHERS = "CHACHA20-POLY1305:AES-256-GCM:AES-256-CBC:AES-128-GCM"
 
 KEYRING_SCHEMA_NAME = "se.ovpn.omarchy"
+WG_SCHEMA_NAME = "se.ovpn.omarchy.wgkey"
+
+# WireGuard: OVPN's resolvers, and the MTU their own client configures.
+WG_DNS = "46.227.67.134, 192.165.9.158"
+WG_MTU = 1320
 
 # Installed by networkmanager-openvpn, which Omarchy does not ship.
 NM_OPENVPN_MARKER = os.environ.get(
@@ -272,6 +280,231 @@ def keyring_clear(username):
         pass
 
 
+def _wg_schema():
+    Secret, _ = _secret()
+    return Secret, Secret.Schema.new(
+        WG_SCHEMA_NAME, Secret.SchemaFlags.NONE, {"username": Secret.SchemaAttributeType.STRING}
+    )
+
+
+def wg_key_lookup(username):
+    try:
+        Secret, schema = _wg_schema()
+        return Secret.password_lookup_sync(schema, {"username": username}, None)
+    except Exception:
+        return None
+
+
+def wg_key_store(username, private_key):
+    Secret, schema = _wg_schema()
+    Secret.password_store_sync(
+        schema, {"username": username}, Secret.COLLECTION_DEFAULT,
+        "OVPN WireGuard key (%s)" % username, private_key, None,
+    )
+
+
+def wg_key_forget(username):
+    try:
+        Secret, schema = _wg_schema()
+        Secret.password_clear_sync(schema, {"username": username}, None)
+    except Exception:
+        pass
+
+
+def generate_keypair():
+    """X25519 via openssl: the last 32 bytes of each DER blob are the key."""
+    import base64
+
+    try:
+        gen = subprocess.run(
+            ["openssl", "genpkey", "-algorithm", "X25519", "-outform", "DER"],
+            capture_output=True, timeout=10,
+        )
+        pub = subprocess.run(
+            ["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+            input=gen.stdout, capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise HelperError("could not run openssl to make a WireGuard key: %s" % e)
+    der, pub = gen.stdout, pub.stdout if pub.returncode == 0 else b""
+    if gen.returncode != 0 or len(der) < 32 or len(pub) < 32:
+        raise HelperError("could not generate a WireGuard key")
+    return base64.b64encode(der[-32:]).decode(), base64.b64encode(pub[-32:]).decode()
+
+
+def keys_api(method, fields, timeout=20):
+    """Form-encoded call to the WireGuard key API. Returns (status, data)."""
+    import urllib.parse
+
+    body = urllib.parse.urlencode(fields).encode()
+    req = urllib.request.Request(
+        KEYS_API, data=body, method=method,
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(raw)
+        except ValueError:
+            return e.code, {}
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise HelperError("could not reach OVPN: %s" % e)
+
+
+def wg_register(username, password):
+    """Register a fresh key. Returns the stored record."""
+    private_key, public_key = generate_keypair()
+    status, data = keys_api("POST", {
+        "username": username, "password": password, "new_key": public_key,
+    })
+    if status == 423:
+        raise HelperError("OVPN is rate-limiting key changes. Try again in a minute.")
+    if status in (401, 403):
+        update_state(passwordRejected=True)
+        fail("OVPN rejected the username or password", authFailed=True)
+    if status != 201:
+        errors = data.get("errors") or {}
+        detail = "; ".join(v[0] for v in errors.values() if v) if errors else ""
+        message = detail or (data.get("error") or {}).get("message") or "could not register the key"
+        if "more than" in message:
+            message += " Remove one on ovpn.com/account/wireguard/keys."
+        raise HelperError(message)
+
+    key = data.get("data") or {}
+    record = {
+        "wgUser": username,
+        "wgPublic": key.get("key") or public_key,
+        "wgId": key.get("id"),
+        "wgIpv4": key.get("ipv4"),
+        "wgIpv6": key.get("ipv6"),
+    }
+    wg_key_store(username, private_key)
+    update_state(**record)
+    return dict(record, private=private_key)
+
+
+def wg_ensure_key(username, password):
+    """The account's key, registering one only when there is none to reuse."""
+    state = load_state()
+    private_key = wg_key_lookup(username)
+    if (private_key and state.get("wgUser") == username
+            and state.get("wgPublic") and state.get("wgIpv4")):
+        return {
+            "wgPublic": state["wgPublic"], "wgIpv4": state["wgIpv4"],
+            "wgIpv6": state.get("wgIpv6"), "private": private_key,
+        }
+    return wg_register(username, password)
+
+
+def wg_forget_key(username, password=None):
+    """Drop our key locally. Returns True when OVPN also dropped its copy;
+    without a password we cannot ask, and the key stays on the account."""
+    state = load_state()
+    public_key = state.get("wgPublic")
+    removed = False
+    if public_key and password and state.get("wgUser"):
+        try:
+            status, _ = keys_api("DELETE", {
+                "username": state["wgUser"], "password": password, "key": public_key,
+            }, timeout=10)
+            # 404: already gone, which is the state we wanted.
+            removed = status in (200, 204, 404)
+        except HelperError:
+            removed = False
+    wg_key_forget(state.get("wgUser") or username or "")
+    update_state(wgUser=None, wgPublic=None, wgId=None, wgIpv4=None, wgIpv6=None)
+    return removed
+
+
+def tunnel_carries_traffic(timeout=8):
+    """Ask OVPN who we are. Anything but an answer means the tunnel is dead."""
+    try:
+        data = http_json(API + "/ptr", timeout=timeout)
+    except HelperError:
+        return False
+    return bool(data.get("success")) or bool(IP_RE.search(json.dumps(data)))
+
+
+def wg_peer(dc, entry_dc=None):
+    """(endpoint, peer public key). Multihop enters at one datacenter and
+    leaves at another, so the endpoint is the entry server on the exit
+    server's multihop port while the peer key stays the exit server's."""
+    exits = [s for s in online_servers(dc) if s.get("public_key")]
+    if not exits:
+        raise HelperError("no WireGuard server in %s" % dc.get("city"))
+    exit_server = exits[0]
+    if entry_dc is None:
+        ports = exit_server.get("wireguard_ports") or []
+        if not ports:
+            raise HelperError("no WireGuard port for %s" % dc.get("city"))
+        return "%s:%d" % (exit_server["ip"], int(ports[0])), exit_server["public_key"], exit_server
+    if entry_dc.get("slug") == dc.get("slug"):
+        raise HelperError("entry and exit must be different locations")
+    hops = [s for s in exits if s.get("multihop_wireguard_port")]
+    entries = online_servers(entry_dc)
+    if not hops or not entries:
+        raise HelperError("multihop is not available for that pair")
+    exit_server = hops[0]
+    return ("%s:%d" % (entries[0]["ip"], int(exit_server["multihop_wireguard_port"])),
+            exit_server["public_key"], exit_server)
+
+
+def write_wg_profile(dc, key, entry_dc=None):
+    """Import a fresh profile. The config carries the private key, so it is
+    written 0600 in the runtime dir and removed once NetworkManager has it."""
+    endpoint, peer_key, exit_server = wg_peer(dc, entry_dc)
+    addresses = ", ".join(a for a in (key.get("wgIpv4"), key.get("wgIpv6")) if a)
+    conf = "\n".join([
+        "[Interface]",
+        "PrivateKey = %s" % key["private"],
+        "Address = %s" % addresses,
+        "DNS = %s" % WG_DNS,
+        "MTU = %d" % WG_MTU,
+        "",
+        "[Peer]",
+        "PublicKey = %s" % peer_key,
+        "AllowedIPs = 0.0.0.0/0, ::/0",
+        "Endpoint = %s" % endpoint,
+        "",
+    ])
+
+    # The file holds the private key until NetworkManager has imported it, so
+    # it lives in a private directory: a fixed path in a shared one could be
+    # pre-created or symlinked by another local user. The name inside sets the
+    # interface name, which cannot exceed 15 characters.
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or STATE_DIR
+    os.makedirs(runtime, exist_ok=True)
+    old_umask = os.umask(0o077)
+    workdir = tempfile.mkdtemp(dir=runtime, prefix="ovpn-wg.")
+    path = os.path.join(workdir, "%s.conf" % WG_IFNAME)
+    try:
+        with open(path, "w") as f:
+            f.write(conf)
+        if wg_profile_exists():
+            nmcli(["connection", "delete", PROFILE_WG], timeout=30)
+        nmcli(["connection", "delete", WG_IFNAME], timeout=30)
+        proc = nmcli(["connection", "import", "type", "wireguard", "file", path], timeout=30)
+        if proc.returncode != 0:
+            raise HelperError("could not import the WireGuard profile: " + proc.stderr.strip())
+    finally:
+        os.umask(old_umask)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    proc = nmcli(["connection", "modify", WG_IFNAME,
+                  "connection.id", PROFILE_WG, "connection.autoconnect", "no",
+                  "ipv4.dns-priority", "-50", "ipv6.dns-priority", "-50"], timeout=30)
+    if proc.returncode != 0:
+        raise HelperError("could not configure the WireGuard profile: " + proc.stderr.strip())
+    return exit_server
+
+
+def wg_profile_exists():
+    return nmcli(["-g", "connection.id", "connection", "show", PROFILE_WG]).returncode == 0
+
+
 def nmcli(args, input_text=None, timeout=90):
     try:
         proc = subprocess.run(
@@ -389,6 +622,7 @@ def activate(password, timeout):
             journal = subprocess.Popen(
                 ["journalctl", "-f", "-n", "0", "-o", "cat", "SYSLOG_IDENTIFIER=nm-openvpn"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
+                preexec_fn=die_with_parent,
             )
             reader = threading.Thread(target=_watch_auth_failed, args=(journal, auth_failed), daemon=True)
             reader.start()
@@ -438,9 +672,9 @@ def forget_cached_secret():
     nmcli(["connection", "modify", PROFILE, "vpn.secrets", ""])
 
 
-def active_details():
+def active_details(profile=PROFILE):
     """Active profile fields, or None. VPN.VPN-STATE is only in the full -t listing."""
-    proc = nmcli(["-t", "connection", "show", "--active", PROFILE])
+    proc = nmcli(["-t", "connection", "show", "--active", profile])
     if proc.returncode != 0:
         return None
     fields = {}
@@ -448,7 +682,8 @@ def active_details():
         key, sep, value = line.partition(":")
         if sep:
             fields.setdefault(key, value)
-    return fields
+    # An inactive profile exits 0 with no output.
+    return fields or None
 
 
 def vpn_state(details):
@@ -457,12 +692,20 @@ def vpn_state(details):
     state = details.get("GENERAL.STATE", "")
     if state == "deactivating":
         return "disconnecting"
+    # WireGuard is a device, not a VPN service: no VPN-STATE, GENERAL.VPN "no".
+    if details.get("GENERAL.VPN") == "no":
+        return "connected" if state == "activated" else "connecting"
     # NMVpnConnectionState 5 = activated.
     if details.get("VPN.VPN-STATE", "").startswith("5"):
         return "connected"
     if state in ("activating", "activated"):
         return "connecting"
     return "off"
+
+
+def live_details():
+    """Whichever of the two profiles is up."""
+    return active_details() or active_details(PROFILE_WG)
 
 
 IP_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
@@ -485,7 +728,7 @@ def public_ip():
 
 def status_payload(with_ip=False):
     state = load_state()
-    details = active_details()
+    details = live_details()
     vs = vpn_state(details)
     address = (details or {}).get("IP4.ADDRESS[1]") if vs == "connected" else None
     payload = {
@@ -532,6 +775,13 @@ def cmd_status(args):
 
 
 def cmd_logout(args):
+    state = load_state()
+    if state.get("wgPublic"):
+        wg_forget_key(state.get("username"), keyring_lookup(state.get("username")))
+    # The profile stores the private key, so it goes with the account.
+    if wg_profile_exists():
+        nmcli(["connection", "down", "id", PROFILE_WG], timeout=20)
+        nmcli(["connection", "delete", "id", PROFILE_WG], timeout=20)
     with state_lock():
         state = load_state()
         username = state.pop("username", None)
@@ -543,10 +793,6 @@ def cmd_logout(args):
 
 
 def cmd_connect(args):
-    if not os.path.isfile(NM_OPENVPN_MARKER):
-        fail("networkmanager-openvpn is not installed", missingOpenvpn=True)
-    if not (os.path.isfile(CA_FILE) and os.path.isfile(TA_FILE)):
-        raise HelperError("CA or tls-auth file missing from %s" % ASSETS)
 
     # Credentials may arrive on stdin for an account not saved yet; only a
     # successful connection commits them.
@@ -564,14 +810,28 @@ def cmd_connect(args):
     remember = bool(data.get("remember")) and bool(data.get("password"))
 
     proto = args.proto or state.get("protocol") or "udp"
+    if proto != "wg":
+        if not os.path.isfile(NM_OPENVPN_MARKER):
+            fail("networkmanager-openvpn is not installed", missingOpenvpn=True)
+        if not (os.path.isfile(CA_FILE) and os.path.isfile(TA_FILE)):
+            raise HelperError("CA or tls-auth file missing from %s" % ASSETS)
     entry, _ = fetch_entry()
     dc = find_datacenter(entry, args.location)
     remotes = None
     exit_server = None
-    if args.via:
-        remotes, exit_server = pick_multihop(find_datacenter(entry, args.via), dc)
-        proto = "udp"
-    write_profile(dc, proto, username, remotes)
+    # One tunnel at a time: the other profile would keep its own default route.
+    other = PROFILE if proto == "wg" else PROFILE_WG
+    if active_details(other) is not None:
+        nmcli(["connection", "down", "id", other], timeout=30)
+
+    if proto == "wg":
+        key = wg_ensure_key(username, password)
+        exit_server = write_wg_profile(dc, key, find_datacenter(entry, args.via) if args.via else None)
+    else:
+        if args.via:
+            remotes, exit_server = pick_multihop(find_datacenter(entry, args.via), dc)
+            proto = "udp"
+        write_profile(dc, proto, username, remotes)
 
     update_state(
         current=dc["slug"],
@@ -586,20 +846,42 @@ def cmd_connect(args):
     # state lock.
     def on_term(signum, frame):
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        nmcli(["connection", "down", "id", PROFILE], timeout=8)
-        nmcli(["connection", "modify", PROFILE, "vpn.secrets", ""], timeout=8)
+        nmcli(["connection", "down", "id", PROFILE_WG if proto == "wg" else PROFILE], timeout=8)
+        if proto != "wg":
+            nmcli(["connection", "modify", PROFILE, "vpn.secrets", ""], timeout=8)
         try_update_state(current=None, currentVia=None, currentServer=None, connectedSince=None)
         emit({"ok": False, "error": "connecting was cut short"})
         os._exit(1)
 
     signal.signal(signal.SIGTERM, on_term)
 
-    ok, error, auth_failed = activate(password, args.timeout)
+    if proto == "wg":
+        # The key registration already proved the account, and WireGuard has
+        # no auth step of its own.
+        proc = nmcli(["--wait", str(args.timeout), "connection", "up", PROFILE_WG],
+                     timeout=args.timeout + 10)
+        ok = proc.returncode == 0
+        auth_failed = False
+        error = None
+        if not ok:
+            lines = [l.strip() for l in (proc.stderr or proc.stdout).strip().splitlines() if l.strip()]
+            errors = [l for l in lines if l.startswith("Error:")] or lines
+            error = errors[0].replace("Error: ", "") if errors else "activation failed"
+        elif not tunnel_carries_traffic():
+            # WireGuard has no handshake to fail: a revoked or unknown key
+            # activates fine and then blackholes everything. Drop the key so
+            # the next attempt registers a fresh one.
+            ok = False
+            error = "OVPN did not answer over WireGuard. Connect again to register a new key."
+            wg_key_forget(username)
+            update_state(wgUser=None, wgPublic=None, wgId=None, wgIpv4=None, wgIpv6=None)
+    else:
+        ok, error, auth_failed = activate(password, args.timeout)
     # The tunnel is decided; a teardown would be wrong from here.
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     if not ok:
         # Otherwise it keeps retrying and holds the default route.
-        nmcli(["connection", "down", "id", PROFILE], timeout=30)
+        nmcli(["connection", "down", "id", PROFILE if proto != "wg" else PROFILE_WG], timeout=30)
         forget_cached_secret()
         update_state(current=None, currentVia=None, currentServer=None, connectedSince=None)
         if auth_failed:
@@ -632,11 +914,14 @@ def cmd_disconnect(args):
     # Unconditional: a connect NetworkManager has not registered yet is
     # invisible to active_details(). A non-zero exit only matters if the
     # profile is still up afterwards.
-    if profile_exists():
-        proc = nmcli(["connection", "down", "id", PROFILE], timeout=30)
-        if proc.returncode != 0 and active_details() is not None:
-            raise HelperError(proc.stderr.strip() or "could not disconnect")
+    failures = []
+    for name in (PROFILE, PROFILE_WG):
+        proc = nmcli(["connection", "down", "id", name], timeout=30)
+        if proc.returncode != 0 and active_details(name) is not None:
+            failures.append(proc.stderr.strip() or "could not disconnect %s" % name)
     update_state(current=None, currentVia=None, currentServer=None, connectedSince=None)
+    if failures:
+        raise HelperError(failures[0])
     emit(status_payload())
 
 
@@ -668,11 +953,18 @@ def cmd_favorite(args):
 def cmd_uninstall(args):
     """Remove everything the plugin created outside its own folder."""
     removed = []
-    if active_details() is not None:
-        nmcli(["connection", "down", "id", PROFILE], timeout=30)
-    if profile_exists() and nmcli(["connection", "delete", "id", PROFILE]).returncode == 0:
-        removed.append("NetworkManager profile '%s'" % PROFILE)
-    username = load_state().get("username")
+    state = load_state()
+    username = state.get("username")
+    if state.get("wgPublic"):
+        if wg_forget_key(username, keyring_lookup(username)):
+            removed.append("WireGuard key (also from your OVPN account)")
+        else:
+            removed.append("WireGuard key locally; remove it on ovpn.com/account/wireguard/keys")
+    for name in (PROFILE, PROFILE_WG):
+        if active_details(name) is not None:
+            nmcli(["connection", "down", "id", name], timeout=30)
+        if nmcli(["connection", "delete", "id", name]).returncode == 0:
+            removed.append("NetworkManager profile '%s'" % name)
     if username and keyring_lookup(username):
         keyring_clear(username)
         removed.append("keyring entry for %s" % username)
@@ -681,6 +973,16 @@ def cmd_uninstall(args):
             shutil.rmtree(path)
             removed.append(path)
     emit({"ok": True, "removed": removed})
+
+
+def die_with_parent():
+    """The shell kills helpers without warning; a child must not outlive one."""
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+    except Exception:
+        pass
 
 
 def cmd_watch(args):
@@ -698,7 +1000,8 @@ def cmd_watch(args):
             emit(payload)
 
     push()
-    mon = subprocess.Popen(["nmcli", "monitor"], stdout=subprocess.PIPE, text=True, bufsize=1)
+    mon = subprocess.Popen(["nmcli", "monitor"], stdout=subprocess.PIPE, text=True, bufsize=1,
+                           preexec_fn=die_with_parent)
     try:
         while True:
             ready, _, _ = select.select([mon.stdout], [], [], args.heartbeat)
@@ -733,7 +1036,7 @@ def main():
 
     p = sub.add_parser("connect", help="connect to a location")
     p.add_argument("location")
-    p.add_argument("--proto", choices=["udp", "tcp"], help="default: the saved preference")
+    p.add_argument("--proto", choices=["udp", "tcp", "wg"], help="default: the saved preference")
     p.add_argument("--via", metavar="ENTRY", help="multihop: enter at this location, exit at LOCATION")
     p.add_argument("--timeout", type=int, default=60)
     p.set_defaults(func=cmd_connect)
@@ -744,7 +1047,7 @@ def main():
     ).set_defaults(func=cmd_uninstall)
 
     p = sub.add_parser("protocol", help="save the preferred protocol")
-    p.add_argument("proto", choices=["udp", "tcp"])
+    p.add_argument("proto", choices=["udp", "tcp", "wg"])
     p.set_defaults(func=cmd_protocol)
 
     p = sub.add_parser("multihop", help="save the multihop entry location, or 'off'")

@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "Pinta365",
   "license": "MIT",
-  "description": "Unofficial OVPN.com client for the Omarchy bar: one-click connect, location list with ping and load, favorites, multihop, UDP or TCP 443, auto-connect. Connects through NetworkManager; not affiliated with OVPN.",
+  "description": "Unofficial OVPN.com client for the Omarchy bar: one-click connect, WireGuard or OpenVPN, location list with ping and load, favorites, multihop, auto-connect. Connects through NetworkManager; not affiliated with OVPN.",
   "kinds": [
     "bar-widget",
     "service"

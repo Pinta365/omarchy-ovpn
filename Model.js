@@ -114,6 +114,10 @@ function sorted(locations, favorites, query) {
   return out
 }
 
+function protocolLabel(proto) {
+  return proto === "wg" ? "WG" : String(proto || "").toUpperCase()
+}
+
 function pingText(ms) {
   return ms === undefined || ms === null ? "–" : ms + " ms"
 }
@@ -140,6 +144,3 @@ function stateTitle(state) {
   return "Not protected"
 }
 
-function address(addr) {
-  return addr ? String(addr).split("/")[0] : ""
-}

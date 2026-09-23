@@ -44,8 +44,9 @@ Panel {
   readonly property var stops: {
     var out = [{ kind: "main" }]
     if (vpn.signedIn) out.push({ kind: "signout" })
-    out.push({ kind: "proto", value: "udp" }, { kind: "proto", value: "tcp" }, { kind: "multihop" })
-    if (vpn.multihop) out.push({ kind: "entry" })
+    out.push({ kind: "proto", value: "udp" }, { kind: "proto", value: "tcp" },
+             { kind: "proto", value: "wg" }, { kind: "multihop" })
+    if (vpn.multihop && !vpn.multihopBlocked) out.push({ kind: "entry" })
     if (!pickingEntry) out.push({ kind: "location", slug: Model.FASTEST })
     for (var i = 0; i < shownLocations.length; i++) out.push({ kind: "location", slug: shownLocations[i].slug })
     return out
@@ -80,8 +81,8 @@ Panel {
     var s = stops[cursor]
     if (!s) return
     if (s.kind === "main") vpn.openvpnMissing ? vpn.installOpenvpn() : vpn.quickToggle()
-    else if (s.kind === "proto") vpn.setProtocol(s.value)
-    else if (s.kind === "multihop") toggleMultihop()
+    else if (s.kind === "proto") vpn.setProtocol(s.value)   // refused when not allowed
+    else if (s.kind === "multihop") { if (!vpn.multihopBlocked) toggleMultihop() }
     else if (s.kind === "entry") pickingEntry = !pickingEntry
     else if (s.kind === "location") chooseLocation(s.slug)
     else if (s.kind === "signout") signOutRequested()
@@ -206,6 +207,9 @@ Panel {
     property var viaLocation: null
     property string pendingUsername: ""
     property bool verifying: false
+    property bool multihopBlocked: false
+    function protocolAllowed(proto) { return true }
+    function cycleProtocol() {}
     property bool passwordRejected: false
     property bool openvpnMissing: false
     property bool installing: false
@@ -371,7 +375,7 @@ Panel {
         else if (key === "d") vpn.disconnect()
         else if (key === "c") vpn.connectTo(vpn.status.last || Model.FASTEST)
         else if (key === "r") { vpn.loadServers(true); vpn.ping(); vpn.lookupIp() }
-        else if (key === "t") vpn.setProtocol(vpn.protocol === "udp" ? "tcp" : "udp")
+        else if (key === "t") vpn.cycleProtocol()
       }
 
       Flickable {
@@ -400,13 +404,11 @@ Panel {
             title: vpn.openvpnMissing ? "OpenVPN support missing" : Model.stateTitle(vpn.state)
             meta: {
               var loc = vpn.connected || Model.isBusy(vpn.state) ? vpn.currentLocation : null
-              var parts = []
-              if (loc) parts.push(vpn.viaLocation ? Model.routeName(loc, vpn.viaLocation) : Model.placeName(loc))
-              if (vpn.publicIp !== "" && !Model.isBusy(vpn.state)) parts.push(vpn.publicIp)
-              return parts.join(" · ")
+              if (loc) return vpn.viaLocation ? Model.routeName(loc, vpn.viaLocation) : Model.placeName(loc)
+              return vpn.publicIp !== "" && !Model.isBusy(vpn.state) ? vpn.publicIp : ""
             }
             detail: vpn.connected && vpn.status.protocol
-                    ? (vpn.status.via ? "MULTIHOP" : vpn.status.protocol.toUpperCase()) : ""
+                    ? (vpn.status.via ? "MULTIHOP" : Model.protocolLabel(vpn.status.protocol)) : ""
             iconComponent: Component {
               Item {
                 implicitWidth: Style.font.display * 1.9
@@ -474,7 +476,7 @@ Panel {
             horizontalAlignment: Text.AlignHCenter
             text: {
               var parts = ["Connected " + Model.duration(vpn.status.since, root.now)]
-              if (vpn.status.tunnelAddress) parts.push("tunnel " + Model.address(vpn.status.tunnelAddress))
+              if (vpn.publicIp !== "") parts.push(vpn.publicIp)
               return parts.join(" · ")
             }
             color: root.dim
@@ -497,7 +499,7 @@ Panel {
               Text {
                 Layout.fillWidth: true
                 text: "Signed in as " + vpn.status.username
-                      + (vpn.status.hasPassword ? " · password remembered" : "")
+                      + (vpn.status.hasPassword ? " · saved" : "")
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -670,14 +672,15 @@ Panel {
             }
 
             Repeater {
-              model: [{ key: "udp", label: "UDP" }, { key: "tcp", label: "TCP 443" }]
+              model: [{ key: "udp", label: "UDP" }, { key: "tcp", label: "TCP 443" },
+                      { key: "wg", label: "WireGuard" }]
               Chip {
                 label: modelData.label
                 selected: vpn.protocol === modelData.key
-                opacity: vpn.multihop && modelData.key === "tcp" ? 0.35 : 1.0
+                opacity: vpn.protocolAllowed(modelData.key) ? 1.0 : 0.35
                 hasCursor: root.stopIs("proto", modelData.key)
                 onEntered: root.takeCursor("proto", modelData.key)
-                onActivated: if (!(vpn.multihop && modelData.key === "tcp")) vpn.setProtocol(modelData.key)
+                onActivated: vpn.setProtocol(modelData.key)
               }
             }
           }
@@ -685,18 +688,21 @@ Panel {
           ToggleRow {
             width: parent.width
             label: "Multihop"
-            caption: vpn.multihop ? "Two locations in a row · UDP only"
-                                  : "Route through two locations"
+            caption: vpn.multihopBlocked ? "Not available over TCP 443"
+                     : vpn.multihop ? "Two locations in a row"
+                     : "Route through two locations"
             checked: vpn.multihop
+            // OVPN has no TCP multihop ports, so the two exclude each other.
+            dimmed: vpn.multihopBlocked
             hasCursor: root.stopIs("multihop")
             onEntered: root.takeCursor("multihop")
-            onActivated: root.toggleMultihop()
+            onActivated: if (!vpn.multihopBlocked) root.toggleMultihop()
           }
 
           CursorSurface {
             id: entryRow
             width: parent.width
-            visible: vpn.multihop
+            visible: vpn.multihop && !vpn.multihopBlocked
             foreground: root.foreground
             bordered: true
             current: root.pickingEntry
@@ -968,11 +974,13 @@ Panel {
     property string label: ""
     property string caption: ""
     property bool checked: false
+    property bool dimmed: false
 
     signal entered()
     signal activated()
 
     foreground: root.foreground
+    opacity: dimmed ? 0.45 : 1.0
     implicitHeight: Math.max(Style.space(30), toggleLabels.implicitHeight + Style.spacing.sm * 2)
 
     MouseArea {

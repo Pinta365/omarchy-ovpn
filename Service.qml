@@ -20,7 +20,6 @@ Item {
   property var locations: []
   property var pings: ({})
   property string publicIp: ""
-  property bool publicProtected: false
 
   property string lastError: ""
   property bool needsCredentials: false
@@ -47,12 +46,28 @@ Item {
   // In the keyring but turned down by OVPN; not used until confirmed.
   readonly property bool passwordRejected: status.passwordRejected === true
   property bool installing: false
-  // Multihop is UDP only, so it overrides the protocol preference.
   readonly property string multihopEntry: status.preferredVia || ""
   readonly property bool multihop: multihopEntry !== ""
   readonly property var entryLocation: Model.byslug(locations, multihopEntry)
   readonly property var viaLocation: Model.byslug(locations, status.via)
-  readonly property string protocol: multihop ? "udp" : (status.preferredProtocol || "udp")
+  // OVPN has no TCP multihop ports, so the two exclude each other.
+  readonly property bool tcpBlocked: multihop
+  readonly property bool multihopBlocked: protocol === "tcp"
+  readonly property var protocols: ["udp", "tcp", "wg"]
+
+  function protocolAllowed(proto) { return proto !== "tcp" || !tcpBlocked }
+
+  function cycleProtocol() {
+    var usable = protocols.filter(protocolAllowed)
+    var here = usable.indexOf(protocol)
+    setProtocol(usable[(here + 1) % usable.length])
+  }
+
+  // Multihop has no TCP ports, so that one preference yields to UDP.
+  readonly property string protocol: {
+    var p = status.preferredProtocol || "udp"
+    return multihop && p === "tcp" ? "udp" : p
+  }
   readonly property var currentLocation: Model.byslug(locations, status.location)
   readonly property var lastLocation: Model.byslug(locations, status.last)
   readonly property var fastestLocation: Model.fastest(locations, pings, multihopEntry)
@@ -257,7 +272,7 @@ Item {
   }
 
   function setProtocol(proto) {
-    if (proto === protocol) return
+    if (proto === protocol || !protocolAllowed(proto)) return
     var s = Object.assign({}, status)
     s.preferredProtocol = proto
     status = s
@@ -432,7 +447,6 @@ Item {
       if (!parsed || !parsed.ok) return
       root.applyStatus(parsed)
       root.publicIp = parsed.ip || ""
-      root.publicProtected = parsed.protected === true
     }
   }
 
