@@ -107,6 +107,18 @@ helper/ovpnctl.py disconnect
 helper/ovpnctl.py watch              # one JSON line per state change
 ```
 
+## Tests
+
+```bash
+/usr/bin/python3 -m unittest discover -s tests   # helper: profile data, multihop, state
+deno test --allow-read tests/model_test.ts       # panel: sorting, fastest pick, formatting
+```
+
+They cover the decisions that would be silently wrong rather than loud:
+what goes into the NetworkManager profile, which server a multihop pair
+connects to, and how the tunnel state is read. Nothing there touches the
+network, NetworkManager or your keyring.
+
 ## Development
 
 Develop in a checkout, copy it into `~/.config/omarchy/plugins/pinta365.ovpn`
