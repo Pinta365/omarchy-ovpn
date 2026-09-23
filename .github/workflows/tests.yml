@@ -1,0 +1,75 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # The validator is a self-contained script; pin it so upstream cannot change
+  # what this repo is checked against without a commit here.
+  OMARCHY_REF: v4.0.4
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      # Stdlib only, and everything that needs NetworkManager, the keyring or
+      # the network is left out, so a bare runner runs these fine.
+      - name: Helper tests
+        run: python3 -m unittest discover -s tests -v
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Model tests
+        run: deno test --allow-read tests/model_test.ts
+
+      - name: Plugin manifest
+        run: |
+          curl -fsSL -o /tmp/omarchy-plugin-validate \
+            "https://raw.githubusercontent.com/basecamp/omarchy/${OMARCHY_REF}/bin/omarchy-plugin-validate"
+          bash /tmp/omarchy-plugin-validate .
+
+      # The whole repo is cloned into users' plugin folders, so a file coding
+      # agents load on their own would steer the agents of everyone who installs.
+      - name: No agent instruction files
+        run: |
+          found="$(git ls-files | grep -iE \
+            '(^|/)(agents?|claude|claude\.local|gemini)\.md$|(^|/)\.(cursorrules|windsurfrules|clinerules)$|(^|/)\.cursor/rules/|^\.github/(copilot-instructions\.md$|instructions/)' \
+            || true)"
+          if [ -n "$found" ]; then
+            echo "These files are loaded by coding agents and must not ship:"
+            echo "$found"
+            exit 1
+          fi
+
+      # The tunnel is only as good as what goes into the profile, and a
+      # missing line here is invisible until someone inspects a live
+      # connection. The helper tests assert the same two, from the parsed
+      # vpn.data rather than the source.
+      - name: OpenVPN profile keeps its guards
+        run: |
+          grep -q '"remote-cert-tls": "server"' helper/ovpnctl.py
+          grep -q '"password-flags": "2"' helper/ovpnctl.py
+
+  # Arch rather than Ubuntu: Ubuntu's Qt is far older than what Omarchy runs,
+  # and its qmllint fails on warnings the current one only reports. Omarchy's
+  # own imports cannot resolve here either way; syntax errors still fail.
+  qml:
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: QML lint
+        run: |
+          pacman -Syu --noconfirm --needed qt6-declarative
+          /usr/lib/qt6/bin/qmllint --version
+          /usr/lib/qt6/bin/qmllint Panel.qml Service.qml ShieldIcon.qml Spinner.qml

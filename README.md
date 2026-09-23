@@ -114,6 +114,9 @@ helper/ovpnctl.py watch              # one JSON line per state change
 deno test --allow-read tests/model_test.ts       # panel: sorting, fastest pick, formatting
 ```
 
+CI runs both on push and pull request, along with `omarchy-plugin-validate`
+and `qmllint`.
+
 They cover the decisions that would be silently wrong rather than loud:
 what goes into the NetworkManager profile, which server a multihop pair
 connects to, and how the tunnel state is read. Nothing there touches the
