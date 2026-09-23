@@ -6,10 +6,13 @@ from stdin or the keyring, never from arguments.
 """
 
 import argparse
+import contextlib
 import json
 import os
+import fcntl
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -76,6 +79,41 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)
 
 
+@contextlib.contextmanager
+def state_lock():
+    """Serialise read-modify-write of state.json across concurrent helpers."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, "state.lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def try_update_state(**changes):
+    """Best effort, never blocks. For signal handlers: taking a lock the
+    interrupted thread may hold would deadlock."""
+    try:
+        with open(os.path.join(STATE_DIR, "state.lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            state = load_state()
+            state.update(changes)
+            save_state(state)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    except (OSError, ValueError):
+        pass
+
+
+def update_state(**changes):
+    """Apply changes to the newest state on disk."""
+    with state_lock():
+        state = load_state()
+        state.update(changes)
+        save_state(state)
+        return state
+
+
 def read_stdin_json():
     """One line of JSON: the shell writes to the pipe but never closes it."""
     if sys.stdin is None or sys.stdin.closed or sys.stdin.isatty():
@@ -138,7 +176,7 @@ def fetch_entry(refresh=False):
 def summarize(dc):
     servers = dc.get("servers") or []
     online = [s for s in servers if s.get("online")]
-    load = round(sum(s.get("load", 0) for s in online) / len(online)) if online else None
+    load = round(sum(s.get("load") or 0 for s in online) / len(online)) if online else None
     return {
         "slug": dc.get("slug"),
         "city": dc.get("city"),
@@ -195,17 +233,28 @@ def _secret():
     return Secret, schema
 
 
-def keyring_lookup(username):
+_KEYRING_CACHE = {}
+
+
+def keyring_lookup(username, max_age=0):
+    """Cached briefly: a lookup on a locked collection blocks and can prompt,
+    and `watch` asks on every event."""
     if not username:
         return None
+    hit = _KEYRING_CACHE.get(username)
+    if hit and max_age and time.time() - hit[0] < max_age:
+        return hit[1]
     try:
         Secret, schema = _secret()
-        return Secret.password_lookup_sync(schema, {"username": username}, None)
+        password = Secret.password_lookup_sync(schema, {"username": username}, None)
     except Exception:
-        return None
+        password = None
+    _KEYRING_CACHE[username] = (time.time(), password)
+    return password
 
 
 def keyring_store(username, password):
+    _KEYRING_CACHE.pop(username, None)
     Secret, schema = _secret()
     ok = Secret.password_store_sync(
         schema, {"username": username}, Secret.COLLECTION_DEFAULT, "OVPN (%s)" % username, password, None
@@ -215,6 +264,7 @@ def keyring_store(username, password):
 
 
 def keyring_clear(username):
+    _KEYRING_CACHE.pop(username, None)
     try:
         Secret, schema = _secret()
         Secret.password_clear_sync(schema, {"username": username}, None)
@@ -240,7 +290,7 @@ def nm_escape(value):
 
 def online_servers(dc):
     servers = [s for s in dc.get("servers") or [] if s.get("online") and s.get("ip")]
-    return sorted(servers, key=lambda s: s.get("load", 100))
+    return sorted(servers, key=lambda s: s.get("load") if s.get("load") is not None else 100)
 
 
 def pick_multihop(entry_dc, exit_dc):
@@ -277,6 +327,8 @@ def vpn_data(dc, proto, username, remotes_override=None):
         "connection-type": "password",
         "data-ciphers": DATA_CIPHERS,
         "dev": "tun",
+        # Without this, any cert chaining to OVPN's CA is accepted.
+        "remote-cert-tls": "server",
         # Never saved; supplied on each activation.
         "password-flags": "2",
         "remote": remotes,
@@ -299,7 +351,7 @@ def profile_exists():
 def write_profile(dc, proto, username, remotes_override=None):
     data = vpn_data(dc, proto, username, remotes_override)
     if profile_exists():
-        # Replaced wholesale so switching to UDP drops proto-tcp.
+        # Wholesale, so switching to UDP drops proto-tcp.
         proc = nmcli(["connection", "modify", PROFILE, "vpn.data", data])
     else:
         proc = nmcli([
@@ -310,45 +362,61 @@ def write_profile(dc, proto, username, remotes_override=None):
         raise HelperError("could not write the NetworkManager profile: " + proc.stderr.strip())
 
 
+def _watch_auth_failed(journal, flag):
+    """Read the journal on a thread: lines sitting in Python's buffer are
+    invisible to select() on the underlying fd."""
+    try:
+        for line in journal.stdout:
+            # The full message: a bare token could appear in any log line.
+            if "AUTH: Received control message: AUTH_FAILED" in line:
+                flag.set()
+                return
+    except (OSError, ValueError):
+        pass
+
+
 def activate(password, timeout):
     """Returns (ok, error, authFailed). OpenVPN retries a rejected password
     forever, so watch the journal for AUTH_FAILED instead of waiting it out."""
-    import select
+    import threading
 
     journal = None
+    auth_failed = threading.Event()
+    reader = None
+    up = None
     try:
-        journal = subprocess.Popen(
-            ["journalctl", "-f", "-n", "0", "-o", "cat", "SYSLOG_IDENTIFIER=nm-openvpn"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
-        )
-    except OSError:
-        journal = None
+        try:
+            journal = subprocess.Popen(
+                ["journalctl", "-f", "-n", "0", "-o", "cat", "SYSLOG_IDENTIFIER=nm-openvpn"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            )
+            reader = threading.Thread(target=_watch_auth_failed, args=(journal, auth_failed), daemon=True)
+            reader.start()
+        except OSError:
+            journal = None
 
-    up = subprocess.Popen(
-        ["nmcli", "--wait", str(timeout), "connection", "up", "id", PROFILE, "passwd-file", "/dev/stdin"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
-    up.stdin.write("vpn.secrets.password:%s\n" % password)
-    up.stdin.close()
+        try:
+            up = subprocess.Popen(
+                ["nmcli", "--wait", str(timeout), "connection", "up", "id", PROFILE,
+                 "passwd-file", "/dev/stdin"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            up.stdin.write("vpn.secrets.password:%s\n" % password)
+            up.stdin.close()
+        except (OSError, ValueError) as e:
+            return False, "could not run nmcli: %s" % e, False
 
-    auth_failed = False
-    deadline = time.time() + timeout + 10
-    try:
+        # Inside the caller's timeout, so cleanup still runs.
+        deadline = time.time() + timeout + 5
         while up.poll() is None and time.time() < deadline:
-            if journal is None:
-                time.sleep(0.2)
-                continue
-            ready, _, _ = select.select([journal.stdout], [], [], 0.2)
-            if ready:
-                line = journal.stdout.readline()
-                if "AUTH_FAILED" in line:
-                    auth_failed = True
-                    break
+            if auth_failed.is_set():
+                break
+            time.sleep(0.1)
     finally:
         if journal is not None:
             journal.terminate()
 
-    if auth_failed:
+    if auth_failed.is_set():
         up.terminate()
         return False, "OVPN rejected the username or password", True
     if up.poll() is None:
@@ -357,8 +425,11 @@ def activate(password, timeout):
 
     stdout, stderr = up.communicate()
     if up.returncode != 0:
-        lines = (stderr or stdout).strip().splitlines()
-        return False, (lines[-1] if lines else "activation failed"), False
+        # nmcli's last line is usually a journalctl hint; the error is above it.
+        lines = [l.strip() for l in (stderr or stdout).strip().splitlines() if l.strip()]
+        errors = [l for l in lines if l.startswith("Error:")] or lines
+        message = errors[0].replace("Error: ", "") if errors else "activation failed"
+        return False, message, False
     return True, None, False
 
 
@@ -428,7 +499,9 @@ def status_payload(with_ip=False):
         "since": state.get("connectedSince") if vs == "connected" else None,
         "tunnelAddress": address,
         "username": state.get("username") or "",
-        "hasPassword": bool(keyring_lookup(state.get("username"))),
+        # A rejected password stays in the keyring but is not offered.
+        "hasPassword": (bool(keyring_lookup(state.get("username"), max_age=30))
+                        and not state.get("passwordRejected")),
         "openvpnSupport": os.path.isfile(NM_OPENVPN_MARKER),
         "favorites": state.get("favorites") or [],
         "preferredProtocol": state.get("protocol") or "udp",
@@ -458,34 +531,14 @@ def cmd_status(args):
     emit(status_payload(with_ip=args.ip))
 
 
-def cmd_login(args):
-    data = read_stdin_json()
-    username = str(data.get("username") or "").strip()
-    password = data.get("password")
-    remember = bool(data.get("remember"))
-    if not username:
-        raise HelperError("username is required")
-
-    state = load_state()
-    previous = state.get("username")
-    if previous and previous != username:
-        keyring_clear(previous)
-    state["username"] = username
-    save_state(state)
-
-    if remember and password:
-        keyring_store(username, str(password))
-    elif not remember:
-        keyring_clear(username)
-    emit({"ok": True, "username": username, "hasPassword": bool(keyring_lookup(username))})
-
-
 def cmd_logout(args):
-    state = load_state()
-    username = state.pop("username", None)
+    with state_lock():
+        state = load_state()
+        username = state.pop("username", None)
+        state.pop("passwordRejected", None)
+        save_state(state)
     if username:
         keyring_clear(username)
-    save_state(state)
     emit({"ok": True})
 
 
@@ -495,15 +548,20 @@ def cmd_connect(args):
     if not (os.path.isfile(CA_FILE) and os.path.isfile(TA_FILE)):
         raise HelperError("CA or tls-auth file missing from %s" % ASSETS)
 
+    # Credentials may arrive on stdin for an account not saved yet; only a
+    # successful connection commits them.
+    data = read_stdin_json()
     state = load_state()
-    username = state.get("username")
+    offered = str(data.get("username") or "").strip()
+    username = offered or state.get("username")
     if not username:
         fail("not signed in", needsLogin=True)
 
-    password = read_stdin_json().get("password") or keyring_lookup(username)
+    password = data.get("password") or keyring_lookup(username)
     if not password:
         emit({"ok": False, "error": "password required", "needsPassword": True})
         sys.exit(1)
+    remember = bool(data.get("remember")) and bool(data.get("password"))
 
     proto = args.proto or state.get("protocol") or "udp"
     entry, _ = fetch_entry()
@@ -515,71 +573,95 @@ def cmd_connect(args):
         proto = "udp"
     write_profile(dc, proto, username, remotes)
 
-    state.update({
-        "current": dc["slug"],
-        "currentVia": args.via or None,
-        "currentServer": exit_server["name"] if exit_server else None,
-        "currentProtocol": proto,
-        "connectedSince": None,
-    })
-    save_state(state)
+    update_state(
+        current=dc["slug"],
+        currentVia=args.via or None,
+        currentServer=exit_server["name"] if exit_server else None,
+        currentProtocol=proto,
+        connectedSince=None,
+    )
+
+    # On SIGTERM from the caller's `timeout`: tear down, clear the secret NM
+    # holds, and stay short. Runs in the main thread, so it never blocks on the
+    # state lock.
+    def on_term(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        nmcli(["connection", "down", "id", PROFILE], timeout=8)
+        nmcli(["connection", "modify", PROFILE, "vpn.secrets", ""], timeout=8)
+        try_update_state(current=None, currentVia=None, currentServer=None, connectedSince=None)
+        emit({"ok": False, "error": "connecting was cut short"})
+        os._exit(1)
+
+    signal.signal(signal.SIGTERM, on_term)
 
     ok, error, auth_failed = activate(password, args.timeout)
+    # The tunnel is decided; a teardown would be wrong from here.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     if not ok:
-        # A failed attempt would otherwise keep retrying and hold the route.
+        # Otherwise it keeps retrying and holds the default route.
         nmcli(["connection", "down", "id", PROFILE], timeout=30)
         forget_cached_secret()
-        state = load_state()
-        state.update({"current": None, "currentVia": None, "currentServer": None, "connectedSince": None})
-        save_state(state)
+        update_state(current=None, currentVia=None, currentServer=None, connectedSince=None)
+        if auth_failed:
+            # Flagged, not deleted: the rejection may be temporary, and the
+            # panel asks instead of retrying the same password.
+            update_state(passwordRejected=True)
         if args.via and not auth_failed and "timed out" in (error or ""):
             error = "Multihop did not answer. It needs the Multihop add-on on your OVPN account."
         emit({"ok": False, "error": error, "authFailed": auth_failed})
         sys.exit(1)
 
     forget_cached_secret()
-    state = load_state()
-    state.update({"last": dc["slug"], "lastVia": args.via or None, "connectedSince": int(time.time())})
-    save_state(state)
+    # Proven, so the account may be saved.
+    if remember:
+        keyring_store(username, str(password))
+    # Re-read under the lock: the snapshot above is up to a minute old.
+    with state_lock():
+        fresh = load_state()
+        previous = fresh.get("username")
+        fresh.update({"username": username, "last": dc["slug"],
+                      "lastVia": args.via or None, "passwordRejected": False,
+                      "connectedSince": int(time.time())})
+        save_state(fresh)
+    if previous and previous != username:
+        keyring_clear(previous)
     emit(status_payload())
 
 
 def cmd_disconnect(args):
-    if active_details() is not None:
+    # Unconditional: a connect NetworkManager has not registered yet is
+    # invisible to active_details(). A non-zero exit only matters if the
+    # profile is still up afterwards.
+    if profile_exists():
         proc = nmcli(["connection", "down", "id", PROFILE], timeout=30)
-        if proc.returncode != 0:
+        if proc.returncode != 0 and active_details() is not None:
             raise HelperError(proc.stderr.strip() or "could not disconnect")
-    state = load_state()
-    state.update({"current": None, "currentVia": None, "currentServer": None, "connectedSince": None})
-    save_state(state)
+    update_state(current=None, currentVia=None, currentServer=None, connectedSince=None)
     emit(status_payload())
 
 
 def cmd_protocol(args):
-    state = load_state()
-    state["protocol"] = args.proto
-    save_state(state)
+    update_state(protocol=args.proto)
     emit({"ok": True, "preferredProtocol": args.proto})
 
 
 def cmd_multihop(args):
-    state = load_state()
-    if args.entry == "off":
-        state["via"] = None
-    else:
+    via = None
+    if args.entry != "off":
         entry, _ = fetch_entry()
-        state["via"] = find_datacenter(entry, args.entry)["slug"]
-    save_state(state)
-    emit({"ok": True, "preferredVia": state["via"]})
+        via = find_datacenter(entry, args.entry)["slug"]
+    update_state(via=via)
+    emit({"ok": True, "preferredVia": via})
 
 
 def cmd_favorite(args):
-    state = load_state()
-    favorites = [f for f in (state.get("favorites") or []) if f != args.location]
-    if args.on:
-        favorites.append(args.location)
-    state["favorites"] = favorites
-    save_state(state)
+    with state_lock():
+        state = load_state()
+        favorites = [f for f in (state.get("favorites") or []) if f != args.location]
+        if args.on:
+            favorites.append(args.location)
+        state["favorites"] = favorites
+        save_state(state)
     emit({"ok": True, "favorites": favorites})
 
 
@@ -647,7 +729,6 @@ def main():
     p.add_argument("--ip", action="store_true", help="also look up the public IP")
     p.set_defaults(func=cmd_status)
 
-    sub.add_parser("login", help="store credentials (JSON on stdin)").set_defaults(func=cmd_login)
     sub.add_parser("logout", help="forget credentials").set_defaults(func=cmd_logout)
 
     p = sub.add_parser("connect", help="connect to a location")

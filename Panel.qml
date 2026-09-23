@@ -11,7 +11,7 @@ Panel {
   id: root
   moduleName: "pinta365.ovpn"
   ipcTarget: "ovpn"
-  // Own IpcHandler below carries the extra methods.
+  // The IpcHandler below carries the extra methods.
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -25,7 +25,9 @@ Panel {
 
   property string query: ""
   readonly property var shownLocations: Model.sorted(vpn.locations, vpn.status.favorites, query)
-  readonly property bool showSignIn: vpn.needsCredentials || (!vpn.signedIn && vpn.everLoaded)
+  // Only ever part of a connect: nothing else can check an account.
+  readonly property bool showSignIn: vpn.needsCredentials || root.verifying
+  readonly property bool verifying: vpn.verifying === true
 
   property real now: Date.now()
   Timer {
@@ -40,12 +42,12 @@ Panel {
   property int cursor: 0
 
   readonly property var stops: {
-    var out = [{ kind: "main" }, { kind: "proto", value: "udp" }, { kind: "proto", value: "tcp" },
-               { kind: "multihop" }]
+    var out = [{ kind: "main" }]
+    if (vpn.signedIn) out.push({ kind: "signout" })
+    out.push({ kind: "proto", value: "udp" }, { kind: "proto", value: "tcp" }, { kind: "multihop" })
     if (vpn.multihop) out.push({ kind: "entry" })
     if (!pickingEntry) out.push({ kind: "location", slug: Model.FASTEST })
     for (var i = 0; i < shownLocations.length; i++) out.push({ kind: "location", slug: shownLocations[i].slug })
-    if (vpn.signedIn) out.push({ kind: "signout" })
     return out
   }
 
@@ -69,8 +71,7 @@ Panel {
 
   function moveCursor(dx, dy) {
     var step = dy !== 0 ? dy : dx
-    // Wrap: the footer is one Up press from the top rather than a whole
-    // location list away.
+    // Wraps, so one Up from the top reaches the end of the list.
     cursor = (cursor + step + stops.length) % stops.length
     Qt.callLater(scrollToCursor)
   }
@@ -86,7 +87,7 @@ Panel {
     else if (s.kind === "signout") signOutRequested()
   }
 
-  // Signing out drops an active tunnel, so that case asks first.
+  // Signing out drops an active tunnel, so it asks first.
   function signOutRequested() {
     if (!confirmSignOut && vpn.state !== Model.STATE_OFF) {
       confirmSignOut = true
@@ -128,11 +129,12 @@ Panel {
 
   function scrollToCursor() {
     var s = stops[cursor]
-    if (s && s.kind === "signout") {
-      panelFlick.contentY = Math.max(0, panelFlick.contentHeight - panelFlick.height)
+    if (!s) return
+    if (s.kind !== "location") {
+      // Everything else sits above the list.
+      panelFlick.contentY = 0
       return
     }
-    if (!s || s.kind !== "location") return
     var item = s.slug === Model.FASTEST ? fastestRow : null
     if (!item) {
       for (var i = 0; i < locationRepeater.count; i++) {
@@ -165,7 +167,7 @@ Panel {
     if (root.opened) found.panelOpened()
   }
 
-  // serviceFor() is a plain call and the service may load later, so poll.
+  // A plain call, and the service may load later, so poll.
   Timer {
     interval: 250
     repeat: true
@@ -202,6 +204,9 @@ Panel {
     property string multihopEntry: ""
     property var entryLocation: null
     property var viaLocation: null
+    property string pendingUsername: ""
+    property bool verifying: false
+    property bool passwordRejected: false
     property bool openvpnMissing: false
     property bool installing: false
     function isFavorite(slug) { return false }
@@ -224,15 +229,32 @@ Panel {
     target: root.service
     ignoreUnknownSignals: true
     function onNeedsCredentialsChanged() {
-      if (root.service.needsCredentials && root.opened) Qt.callLater(root.focusSignIn)
+      if (root.service.needsCredentials && root.opened) signInFocusTimer.restart()
+    }
+    function onAuthFailedChanged() {
+      // The form may already be visible, so nothing else refills it.
+      if (!root.service.authFailed) return
+      userField.text = root.service.pendingUsername || root.service.status.username || ""
+      if (root.opened) signInFocusTimer.restart()
     }
   }
 
+  Timer {
+    id: signInFocusTimer
+    interval: 120
+    onTriggered: root.focusSignIn()
+  }
+
   function focusSignIn() {
-    if (!root.showSignIn) return
-    if (userField.text === "") userField.text = vpn.status.username || ""
-    if (userField.visible && userField.text === "") userField.forceActiveFocus()
-    else passwordField.forceActiveFocus()
+    if (!root.showSignIn || !root.opened) return
+    if (userField.text === "") userField.text = vpn.pendingUsername || vpn.status.username || ""
+    // After a rejection the username is the likelier thing to fix.
+    if (userField.visible && (userField.text === "" || vpn.authFailed)) {
+      userField.forceActiveFocus()
+      userField.selectAll()
+    } else {
+      passwordField.forceActiveFocus()
+    }
   }
 
   onOpenedChanged: {
@@ -240,12 +262,21 @@ Panel {
       if (opened) service.panelOpened()
       else service.panelClosed()
     }
-    if (!opened) {
+    if (opened) {
+      // Nothing else focuses an already-visible form, and the window needs
+      // a moment before it can take focus.
+      if (showSignIn) signInFocusTimer.restart()
+      return
+    }
+    {
       pickingEntry = false
       confirmSignOut = false
       query = ""
       cursorActive = false
       cursor = 0
+      // Never leave typed credentials sitting in the panel.
+      userField.text = ""
+      passwordField.text = ""
     }
   }
 
@@ -356,8 +387,8 @@ Panel {
 
         Column {
           id: column
-          // Inset so control borders never sit on the Flickable's clip edge,
-          // where fractional scaling rounds them away.
+          // Inset: a border on the clip edge is rounded away by fractional
+          // scaling.
           x: Style.space(2)
           width: panelFlick.width - Style.space(4)
           spacing: Style.space(10)
@@ -377,11 +408,24 @@ Panel {
             detail: vpn.connected && vpn.status.protocol
                     ? (vpn.status.via ? "MULTIHOP" : vpn.status.protocol.toUpperCase()) : ""
             iconComponent: Component {
-              ShieldIcon {
-                iconSize: Style.font.display * 1.25
-                filled: vpn.connected
-                pulsing: Model.isBusy(vpn.state)
-                color: vpn.connected ? root.accent : root.foreground
+              Item {
+                implicitWidth: Style.font.display * 1.9
+                implicitHeight: Style.font.display * 1.9
+
+                ShieldIcon {
+                  anchors.centerIn: parent
+                  iconSize: Style.font.display * 1.25
+                  filled: vpn.connected
+                  pulsing: false
+                  color: vpn.connected ? root.accent : root.foreground
+                }
+
+                Spinner {
+                  anchors.centerIn: parent
+                  size: parent.width
+                  running: Model.isBusy(vpn.state)
+                  color: root.accent
+                }
               }
             }
           }
@@ -394,6 +438,7 @@ Panel {
               if (vpn.state === Model.STATE_CONNECTING) return "Cancel"
               if (vpn.state === Model.STATE_DISCONNECTING) return "Disconnecting…"
               if (vpn.connected) return "Disconnect"
+              if (!vpn.signedIn) return "Sign in and connect"
               var target = vpn.lastLocation && vpn.lastLocation.slug !== vpn.multihopEntry
                            ? vpn.lastLocation : vpn.fastestLocation
               if (!target) return "Connect"
@@ -437,26 +482,103 @@ Panel {
             font.pixelSize: Style.font.caption
           }
 
+          PanelSeparator { width: parent.width; visible: vpn.signedIn }
+
+          Column {
+            width: parent.width
+            visible: vpn.signedIn
+            spacing: Style.space(6)
+
+            RowLayout {
+              width: parent.width
+              visible: !root.confirmSignOut
+              spacing: Style.space(6)
+
+              Text {
+                Layout.fillWidth: true
+                text: "Signed in as " + vpn.status.username
+                      + (vpn.status.hasPassword ? " · password remembered" : "")
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+
+              Chip {
+                label: "Sign out"
+                hasCursor: root.stopIs("signout")
+                onEntered: root.takeCursor("signout")
+                onActivated: root.signOutRequested()
+              }
+            }
+
+            Column {
+              width: parent.width
+              visible: root.confirmSignOut
+              spacing: Style.space(6)
+
+              Text {
+                width: parent.width
+                text: "Signing out disconnects you from " + Model.placeName(vpn.currentLocation) + "."
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              Row {
+                spacing: Style.space(6)
+
+                Chip {
+                  label: "Sign out and disconnect"
+                  hasCursor: root.stopIs("signout")
+                  onEntered: root.takeCursor("signout")
+                  onActivated: root.signOutRequested()
+                }
+
+                Chip {
+                  label: "Cancel"
+                  onActivated: root.confirmSignOut = false
+                }
+              }
+            }
+          }
+
           Column {
             id: signIn
             width: parent.width
             visible: root.showSignIn
             spacing: Style.space(6)
 
+            onVisibleChanged: if (visible && root.opened) signInFocusTimer.restart()
+
             PanelSeparator { width: parent.width }
 
             PanelSectionHeader {
               width: parent.width
               text: vpn.authFailed ? "Wrong username or password"
-                    : vpn.signedIn ? "Password for " + vpn.status.username : "Sign in to OVPN"
+                    : vpn.signedIn ? "Password for " + vpn.status.username : "Sign in to connect"
               foreground: vpn.authFailed ? root.urgent : root.foreground
               fontFamily: root.fontFamily
             }
 
             Text {
               width: parent.width
+              visible: !vpn.signedIn && !vpn.authFailed
+              text: "OVPN only accepts or rejects an account when you connect, "
+                    + "so signing in connects you. Nothing is saved unless it works."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Text {
+              width: parent.width
               visible: vpn.signedIn && !vpn.authFailed
-              text: "Not remembered, so it's asked once per session."
+              text: vpn.passwordRejected
+                    ? "OVPN turned down the saved password. It is still in your keyring, but not used until this works."
+                    : "Not remembered, so it's asked once per session."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -466,11 +588,13 @@ Panel {
             TextField {
               id: userField
               width: parent.width
-              // A known username only needs its password; a wrong one needs both.
+              enabled: !root.verifying
+              // A known username only needs its password.
               visible: !vpn.signedIn || vpn.authFailed
               placeholderText: "Username"
               foreground: root.foreground
-              text: vpn.status.username || ""
+              // Set by focusSignIn and the rejection handler; not bound,
+              // since clearing the field would destroy the binding.
               onAccepted: passwordField.forceActiveFocus()
               Keys.onEscapePressed: { vpn.cancelSignIn(); keyCatcher.forceActiveFocus() }
             }
@@ -478,6 +602,7 @@ Panel {
             TextField {
               id: passwordField
               width: parent.width
+              enabled: !root.verifying
               password: true
               placeholderText: "Password"
               foreground: root.foreground
@@ -500,13 +625,23 @@ Panel {
 
               Button {
                 Layout.fillWidth: true
-                text: vpn.signedIn && !vpn.authFailed ? "Continue" : "Sign in"
+                text: root.verifying ? "Signing in…"
+                      : vpn.signedIn && !vpn.authFailed ? "Connect" : "Sign in and connect"
                 selected: true
                 bordered: true
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 enabled: !vpn.busy
                 onClicked: root.submitSignIn()
+
+                Spinner {
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(10)
+                  size: Style.font.body
+                  running: root.verifying
+                  color: root.foreground
+                }
               }
 
               Button {
@@ -699,67 +834,6 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
-          PanelSeparator { width: parent.width; visible: vpn.signedIn }
-
-          Column {
-            width: parent.width
-            visible: vpn.signedIn
-            spacing: Style.space(6)
-
-            RowLayout {
-              width: parent.width
-              visible: !root.confirmSignOut
-              spacing: Style.space(6)
-
-              Text {
-                Layout.fillWidth: true
-                text: "Signed in as " + vpn.status.username
-                      + (vpn.status.hasPassword ? " · password remembered" : "")
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
-              }
-
-              Chip {
-                label: "Sign out"
-                hasCursor: root.stopIs("signout")
-                onEntered: root.takeCursor("signout")
-                onActivated: root.signOutRequested()
-              }
-            }
-
-            Column {
-              width: parent.width
-              visible: root.confirmSignOut
-              spacing: Style.space(6)
-
-              Text {
-                width: parent.width
-                text: "Signing out disconnects you from " + Model.placeName(vpn.currentLocation) + "."
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
-
-              Row {
-                spacing: Style.space(6)
-
-                Chip {
-                  label: "Sign out and disconnect"
-                  hasCursor: root.stopIs("signout")
-                  onEntered: root.takeCursor("signout")
-                  onActivated: root.signOutRequested()
-                }
-
-                Chip {
-                  label: "Cancel"
-                  onActivated: root.confirmSignOut = false
-                }
-              }
-            }
-          }
         }
       }
     }
@@ -768,7 +842,9 @@ Panel {
   function submitSignIn() {
     vpn.signIn(userField.text, passwordField.text, rememberRow.checked)
     passwordField.text = ""
-    keyCatcher.forceActiveFocus()
+    // Deferred: focus handed back inside the key event would let the same
+    // Return reach the panel and press the main button.
+    Qt.callLater(function () { keyCatcher.forceActiveFocus() })
   }
 
   component LocationRow: CursorSurface {

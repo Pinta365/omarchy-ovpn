@@ -3,13 +3,13 @@ import Quickshell
 import Quickshell.Io
 import "Model.js" as Model
 
-// Shared state for every bar instance (one widget per monitor). A session-only
-// password is kept here and passed to the helper on stdin, never in argv.
+// Shared state for every bar instance. A session-only password is kept here
+// and passed to the helper on stdin, never in argv.
 Item {
   id: root
 
   property var shell: null
-  // Pushed in by the widgets; services get no settings of their own.
+  // Pushed in by the widgets.
   property var settings: ({})
   property bool settingsReady: false
   onSettingsChanged: settingsReady = true
@@ -29,6 +29,11 @@ Item {
   property string intent: ""        // "", "connect", "disconnect"
   property string pendingLocation: ""
   property string sessionPassword: ""
+  // Typed but unproven, until a connection confirms the account.
+  property string pendingUsername: ""
+  property bool pendingRemember: false
+  // From a sign-in submit until the connection checking it answers.
+  property bool verifying: false
   property bool autoConnectDone: false
   property bool everLoaded: false
 
@@ -36,8 +41,11 @@ Item {
   readonly property bool connected: state === Model.STATE_CONNECTED
   readonly property bool busy: Model.isBusy(state) || actionProcess.running
   readonly property bool signedIn: String(status.username || "") !== ""
-  readonly property bool canConnect: signedIn && (status.hasPassword || sessionPassword !== "")
+  readonly property bool canConnect: (signedIn || pendingUsername !== "")
+                                     && (status.hasPassword || sessionPassword !== "")
   readonly property bool openvpnMissing: everLoaded && status.openvpnSupport === false
+  // In the keyring but turned down by OVPN; not used until confirmed.
+  readonly property bool passwordRejected: status.passwordRejected === true
   property bool installing: false
   // Multihop is UDP only, so it overrides the protocol preference.
   readonly property string multihopEntry: status.preferredVia || ""
@@ -134,10 +142,11 @@ Item {
   }
 
   function connectTo(slug) {
-    if (actionProcess.running || openvpnMissing) return
+    if (actionProcess.running || openvpnMissing) { verifying = false; return }
     var target = resolveTarget(slug, multihopEntry)
-    if (target === "") { lastError = "No locations loaded yet"; return }
+    if (target === "") { verifying = false; lastError = "No locations loaded yet"; return }
     if (multihop && target === multihopEntry) {
+      verifying = false
       lastError = "Pick an exit location other than the entry (" + (entryLocation ? entryLocation.city : multihopEntry) + ")"
       return
     }
@@ -155,13 +164,19 @@ Item {
     s.location = target
     s.via = multihop ? multihopEntry : null
     status = s
-    var secret = sessionPassword !== "" ? JSON.stringify({ password: sessionPassword }) : "{}"
+    var payload = ({})
+    if (sessionPassword !== "") {
+      payload.password = sessionPassword
+      payload.remember = pendingRemember
+    }
+    if (pendingUsername !== "") payload.username = pendingUsername
+    var secret = JSON.stringify(payload)
     var args = ["connect", target, "--timeout", "45"]
     if (multihop) args.push("--via", multihopEntry)
     runAction("connect", args, secret, 60)
   }
 
-  // Separate from the action slot so it can cancel a connect in flight.
+  // Own process, so it can cancel a connect in flight.
   function disconnect() {
     if (disconnectProcess.running) return
     intent = "disconnect"
@@ -191,19 +206,37 @@ Item {
       lastError = "Enter your OVPN username and password"
       return
     }
+    // Only a connection verifies credentials, so sign-in carries them into
+    // one. The helper saves the account only if it works.
     sessionPassword = password
-    runAction("login", ["login"], JSON.stringify({ username: user, password: password, remember: remember === true }), 20)
+    pendingUsername = user
+    pendingRemember = remember === true
+    authFailed = false
+    verifying = true
+    connectTo(pendingLocation !== "" ? pendingLocation : (status.last || Model.FASTEST))
   }
 
+  // Own process: a connect in flight owns the action slot.
   function signOut() {
     if (state !== Model.STATE_OFF) disconnect()
     sessionPassword = ""
-    runAction("logout", ["logout"], "{}", 20)
+    pendingUsername = ""
+    pendingRemember = false
+    verifying = false
+    needsCredentials = false
+    var cleared = Object.assign({}, status)
+    cleared.username = ""
+    cleared.hasPassword = false
+    status = cleared
+    logoutProcess.command = commandFor(["logout"], 20)
+    logoutProcess.running = true
   }
 
   function cancelSignIn() {
+    verifying = false
     needsCredentials = false
     pendingLocation = ""
+    pendingUsername = ""
     authFailed = false
   }
 
@@ -235,7 +268,7 @@ Item {
   function applyStatus(parsed) {
     if (!parsed || parsed.ok !== true || parsed.state === undefined) return
     var before = status.state
-    // Keep the optimistic state while our own connect is still starting.
+    // Hold the optimistic state while our own connect is starting.
     if (actionProcess.running && actionProcess.kind === "connect" && intent === "connect"
         && parsed.state === Model.STATE_OFF) {
       var keep = Object.assign({}, parsed)
@@ -276,21 +309,9 @@ Item {
   }
 
   function applyAction(kind, parsed) {
+    if (kind === "connect") verifying = false
     if (!parsed) {
       lastError = "The helper returned nothing"
-      return
-    }
-    if (kind === "login") {
-      if (parsed.ok) {
-        needsCredentials = false
-        var s = Object.assign({}, status)
-        s.username = parsed.username
-        s.hasPassword = parsed.hasPassword
-        status = s
-        if (pendingLocation !== "") connectTo(pendingLocation)
-      } else {
-        lastError = parsed.error || "Sign-in failed"
-      }
       return
     }
     if (kind === "logout") {
@@ -301,6 +322,10 @@ Item {
       return
     }
     if (parsed.ok) {
+      // Proven; the helper has saved the account, keyring included.
+      pendingUsername = ""
+      pendingRemember = false
+      needsCredentials = false
       applyStatus(parsed)
       return
     }
@@ -369,11 +394,9 @@ Item {
       secret = "{}"
     }
     onExited: function (exitCode) {
-      if (exitCode === 124) {
-        root.applyAction(kind, { ok: false, error: "Timed out" })
-      } else {
-        root.applyAction(kind, Model.parse(actionOut.text))
-      }
+      // The helper prints why even when killed, so prefer its message.
+      var parsed = Model.parse(actionOut.text)
+      root.applyAction(kind, parsed || { ok: false, error: exitCode === 124 ? "Timed out" : "The helper returned nothing" })
     }
   }
 
@@ -423,6 +446,15 @@ Item {
     }
   }
 
+  Process {
+    id: logoutProcess
+    stdout: StdioCollector { id: logoutOut; waitForEnd: true }
+    onExited: {
+      var parsed = Model.parse(logoutOut.text)
+      if (parsed && parsed.ok === false && parsed.error) root.lastError = parsed.error
+    }
+  }
+
   Process { id: favoriteProcess }
   Process { id: multihopProcess }
   Process { id: protocolProcess }
@@ -457,7 +489,7 @@ Item {
     onTriggered: root.loadServers(false)
   }
 
-  // Keep load figures fresh for the fastest pick.
+  // Load figures feed the fastest pick.
   Timer {
     interval: 3600 * 1000
     running: true
