@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "id": "pinta365.ovpn",
-  "name": "OVPN",
+  "name": "OVPN Client",
   "version": "0.1.0",
   "author": "Pinta365",
   "license": "MIT",
-  "description": "OVPN.com VPN in the Omarchy bar: one-click connect, location list with ping and load, favorites, UDP/TCP, auto-connect.",
+  "description": "Unofficial OVPN.com client for the Omarchy bar: one-click connect, location list with ping and load, favorites, multihop, UDP or TCP 443, auto-connect. Connects through NetworkManager; not affiliated with OVPN.",
   "kinds": [
     "bar-widget",
     "service"
@@ -16,7 +16,7 @@
   },
   "barWidget": {
     "displayName": "OVPN",
-    "description": "Connect to OVPN locations through NetworkManager, with live status in the bar.",
+    "description": "Connect to OVPN.com locations through NetworkManager, with live status in the bar.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",

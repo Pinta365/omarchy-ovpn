@@ -1,11 +1,26 @@
-# OVPN for the Omarchy shell
+# OVPN Client for the Omarchy shell
 
 A bar widget and panel for [OVPN](https://www.ovpn.com/) that works like the
 official desktop client: one-click connect, a location list with ping, load
-and favorites, UDP or TCP 443, a drop notification and auto-connect.
+and favorites, multihop, UDP or TCP 443, a drop notification and auto-connect.
+
+![The OVPN panel open from the Omarchy bar, connected, with the location list](preview.png)
+
+Plugin id: `pinta365.ovpn`.
 
 NetworkManager does the tunnelling (`networkmanager-openvpn`), so there is no
 daemon and nothing runs as root.
+
+Not affiliated with, endorsed by, or supported by OVPN Integritet AB. It signs
+in with your own OVPN account and talks to the same undocumented endpoints the
+official client uses, which OVPN can change at any time. "OVPN" is their name,
+used here only to say what this connects to.
+
+`assets/ovpn-ca.pem` and `assets/ovpn-ta.key` are OVPN's own public files: the
+certificate authority that proves a server is theirs, and the tls-auth key that
+guards the handshake. They are byte-identical to the ones in OVPN's official
+client and in every config they hand out, and are the same for all customers.
+No private key is included.
 
 ## Install
 
@@ -63,7 +78,7 @@ cleared as soon as the tunnel is up.
 helper/ovpnctl.py servers            # locations (cached for an hour)
 helper/ovpnctl.py ping               # latency per location
 helper/ovpnctl.py status --ip        # state and public IP
-echo '{"username":"me","password":"…","remember":false}' | helper/ovpnctl.py login
+echo '{"username":"me","password":"…","remember":true}' | helper/ovpnctl.py connect sthlm
 echo '{"password":"…"}' | helper/ovpnctl.py connect sthlm --proto tcp
 echo '{"password":"…"}' | helper/ovpnctl.py connect oslo --via sthlm   # multihop
 helper/ovpnctl.py disconnect
