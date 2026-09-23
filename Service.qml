@@ -55,7 +55,10 @@ Item {
   readonly property bool multihopBlocked: protocol === "tcp"
   readonly property var protocols: ["udp", "tcp", "wg"]
 
-  function protocolAllowed(proto) { return proto !== "tcp" || !tcpBlocked }
+  function protocolAllowed(proto) {
+    if (proto === "tcp" && tcpBlocked) return false
+    return proto === "wg" || !openvpnMissing
+  }
 
   function cycleProtocol() {
     var usable = protocols.filter(protocolAllowed)
@@ -63,9 +66,11 @@ Item {
     setProtocol(usable[(here + 1) % usable.length])
   }
 
-  // Multihop has no TCP ports, so that one preference yields to UDP.
+  // A preference that cannot be honoured yields rather than blocking: no TCP
+  // ports for multihop, no OpenVPN at all without the add-on.
   readonly property string protocol: {
     var p = status.preferredProtocol || "udp"
+    if (openvpnMissing && p !== "wg") return "wg"
     return multihop && p === "tcp" ? "udp" : p
   }
   readonly property var currentLocation: Model.byslug(locations, status.location)
@@ -157,7 +162,7 @@ Item {
   }
 
   function connectTo(slug) {
-    if (actionProcess.running || openvpnMissing) { verifying = false; return }
+    if (actionProcess.running) { verifying = false; return }
     var target = resolveTarget(slug, multihopEntry)
     if (target === "") { verifying = false; lastError = "No locations loaded yet"; return }
     if (multihop && target === multihopEntry) {
@@ -316,7 +321,7 @@ Item {
   function maybeAutoConnect() {
     if (autoConnectDone || !everLoaded || !settingsReady || locations.length === 0) return
     autoConnectDone = true
-    if (!autoConnect || state !== Model.STATE_OFF || !canConnect || openvpnMissing) return
+    if (!autoConnect || state !== Model.STATE_OFF || !canConnect) return
     var target = Model.FASTEST
     if (autoConnectTarget === "Last used" && status.last) target = status.last
     else if (autoConnectTarget === "First favorite" && (status.favorites || []).length > 0) target = status.favorites[0]

@@ -45,7 +45,9 @@ Panel {
     var out = [{ kind: "main" }]
     if (vpn.signedIn) out.push({ kind: "signout" })
     out.push({ kind: "proto", value: "udp" }, { kind: "proto", value: "tcp" },
-             { kind: "proto", value: "wg" }, { kind: "multihop" })
+             { kind: "proto", value: "wg" })
+    if (vpn.openvpnMissing) out.push({ kind: "install" })
+    out.push({ kind: "multihop" })
     if (vpn.multihop && !vpn.multihopBlocked) out.push({ kind: "entry" })
     if (!pickingEntry) out.push({ kind: "location", slug: Model.FASTEST })
     for (var i = 0; i < shownLocations.length; i++) out.push({ kind: "location", slug: shownLocations[i].slug })
@@ -80,8 +82,9 @@ Panel {
   function activateCursor() {
     var s = stops[cursor]
     if (!s) return
-    if (s.kind === "main") vpn.openvpnMissing ? vpn.installOpenvpn() : vpn.quickToggle()
+    if (s.kind === "main") vpn.quickToggle()
     else if (s.kind === "proto") vpn.setProtocol(s.value)   // refused when not allowed
+    else if (s.kind === "install") vpn.installOpenvpn()
     else if (s.kind === "multihop") { if (!vpn.multihopBlocked) toggleMultihop() }
     else if (s.kind === "entry") pickingEntry = !pickingEntry
     else if (s.kind === "location") chooseLocation(s.slug)
@@ -336,7 +339,7 @@ Panel {
       }
     }
     onPressed: function (buttonCode) {
-      if (buttonCode === Qt.MiddleButton && !vpn.openvpnMissing) vpn.quickToggle()
+      if (buttonCode === Qt.MiddleButton) vpn.quickToggle()
       else root.toggle()
     }
   }
@@ -401,7 +404,7 @@ Panel {
             width: parent.width
             foreground: root.foreground
             fontFamily: root.fontFamily
-            title: vpn.openvpnMissing ? "OpenVPN support missing" : Model.stateTitle(vpn.state)
+            title: Model.stateTitle(vpn.state)
             meta: {
               var loc = vpn.connected || Model.isBusy(vpn.state) ? vpn.currentLocation : null
               if (loc) return vpn.viaLocation ? Model.routeName(loc, vpn.viaLocation) : Model.placeName(loc)
@@ -436,7 +439,6 @@ Panel {
             id: mainButton
             width: parent.width
             text: {
-              if (vpn.openvpnMissing) return vpn.installing ? "Installing…" : "Install OpenVPN support"
               if (vpn.state === Model.STATE_CONNECTING) return "Cancel"
               if (vpn.state === Model.STATE_DISCONNECTING) return "Disconnecting…"
               if (vpn.connected) return "Disconnect"
@@ -455,19 +457,8 @@ Panel {
             verticalPadding: Style.space(9)
             hasCursor: root.stopIs("main")
             enabled: vpn.state !== Model.STATE_DISCONNECTING
-            onClicked: vpn.openvpnMissing ? vpn.installOpenvpn() : vpn.quickToggle()
+            onClicked: vpn.quickToggle()
             onHovered: function (on) { if (on) root.takeCursor("main") }
-          }
-
-          Text {
-            width: parent.width
-            visible: vpn.openvpnMissing
-            text: "OVPN connects through NetworkManager's OpenVPN add-on, networkmanager-openvpn, "
-                  + "which Omarchy does not include. Install opens a terminal and asks for your password there."
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
           }
 
           Text {
@@ -682,6 +673,29 @@ Panel {
                 onEntered: root.takeCursor("proto", modelData.key)
                 onActivated: vpn.setProtocol(modelData.key)
               }
+            }
+          }
+
+          RowLayout {
+            width: parent.width
+            visible: vpn.openvpnMissing
+            spacing: Style.space(8)
+
+            Text {
+              Layout.fillWidth: true
+              text: vpn.installing ? "Installing…"
+                    : "UDP and TCP need networkmanager-openvpn, which Omarchy does not include."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Chip {
+              label: "Install"
+              hasCursor: root.stopIs("install")
+              onEntered: root.takeCursor("install")
+              onActivated: vpn.installOpenvpn()
             }
           }
 
