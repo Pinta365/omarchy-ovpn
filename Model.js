@@ -7,8 +7,13 @@ var STATE_DISCONNECTING = "disconnecting"
 
 var FASTEST = "__fastest__"
 
+// Input hygiene, not a memory bound: the collector has already buffered the
+// text by the time this runs. The helper's replies are a few kilobytes.
+var MAX_OUTPUT_CHARS = 1024 * 1024
+
 function parse(text) {
   if (!text) return null
+  if (String(text).length > MAX_OUTPUT_CHARS) return null
   var lines = String(text).trim().split("\n")
   // Last JSON line wins, so a stray warning above it is ignored.
   for (var i = lines.length - 1; i >= 0; i--) {

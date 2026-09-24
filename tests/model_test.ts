@@ -9,7 +9,8 @@ import { assertEquals } from "jsr:@std/assert@1"
 const source = await Deno.readTextFile(new URL("../Model.js", import.meta.url))
 const Model = new Function(`
   ${source}
-  return { parse, flag, sorted, fastest, protocolLabel, duration, routeName, stateTitle }
+  return { parse, flag, sorted, fastest, protocolLabel, duration, routeName, stateTitle,
+           MAX_OUTPUT_CHARS }
 `)() as Record<string, any>
 
 const loc = (slug: string, country = "SE", online = 1, load = 10) => ({
@@ -20,6 +21,14 @@ Deno.test("parse takes the last JSON line, ignoring noise above it", () => {
   assertEquals(Model.parse('warning: something\n{"ok":true,"state":"off"}').state, "off")
   assertEquals(Model.parse("not json at all"), null)
   assertEquals(Model.parse(""), null)
+})
+
+Deno.test("parse refuses output too large to be ours", () => {
+  const cap = Model.MAX_OUTPUT_CHARS as number
+  assertEquals(Model.parse("x".repeat(cap + 1) + '\n{"ok":true}'), null)
+  // At the cap it is still ours to read.
+  const atCap = '{"ok":true}'.padStart(cap, " ")
+  assertEquals(Model.parse(atCap).ok, true)
 })
 
 Deno.test("fastest weighs load and skips offline and excluded locations", () => {

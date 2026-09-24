@@ -431,6 +431,9 @@ Item {
         root.maybeAutoConnect()
       } else if (parsed && parsed.error) {
         root.lastError = parsed.error
+      } else if (root.locations.length === 0) {
+        // Killed, or output we could not read: an empty list needs a reason.
+        root.lastError = "Could not read the location list"
       }
     }
   }
@@ -461,7 +464,7 @@ Item {
     onExited: {
       var parsed = Model.parse(disconnectOut.text)
       if (parsed && parsed.ok) root.applyStatus(parsed)
-      else if (parsed && parsed.error) root.lastError = parsed.error
+      else root.lastError = (parsed && parsed.error) || "Could not disconnect"
     }
   }
 
@@ -470,7 +473,8 @@ Item {
     stdout: StdioCollector { id: logoutOut; waitForEnd: true }
     onExited: {
       var parsed = Model.parse(logoutOut.text)
-      if (parsed && parsed.ok === false && parsed.error) root.lastError = parsed.error
+      if (!parsed) root.lastError = "Signing out did not finish"
+      else if (parsed.ok === false && parsed.error) root.lastError = parsed.error
     }
   }
 

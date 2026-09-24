@@ -21,6 +21,10 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
+# The server list is ~40 KB; every other reply is a few hundred bytes. The
+# deadline comes from each caller's own timeout.
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
 API = "https://www.ovpn.com/v2/api/client"
 KEYS_API = "https://www.ovpn.com/v4/api/keys"
 PROFILE = "OVPN (Omarchy)"
@@ -138,16 +142,54 @@ def read_stdin_json():
     return data
 
 
+def read_body(resp, seconds):
+    """Read a response under a size cap and a deadline for the whole transfer.
+    read1 rather than read: read blocks for a full buffer, which is exactly
+    how a trickled body would outlast the deadline."""
+    deadline = time.monotonic() + seconds
+    declared = None
+    try:
+        header = resp.headers.get("Content-Length")
+        declared = int(header) if header is not None else None
+    except (AttributeError, TypeError, ValueError):
+        declared = None
+    if declared is not None and declared > MAX_RESPONSE_BYTES:
+        raise HelperError("the server sent more data than expected")
+
+    chunks = []
+    total = 0
+    while True:
+        chunk = resp.read1(65536)
+        if not chunk:
+            # read1 does not enforce Content-Length the way read() does.
+            if declared is not None and total < declared:
+                raise HelperError("the server's reply was cut short")
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > MAX_RESPONSE_BYTES:
+            raise HelperError("the server sent more data than expected")
+        chunks.append(chunk)
+        # A complete body is complete, however long it took to arrive.
+        if declared is not None and total >= declared:
+            return b"".join(chunks)
+        if time.monotonic() > deadline:
+            raise HelperError("the server took too long to answer")
+
+
 def http_json(url, timeout=10):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            return json.loads(read_body(resp, timeout).decode("utf-8"))
     except urllib.error.HTTPError as e:
+        # The status is the useful part, so a body that is oversized, cut
+        # short or slow must not replace it.
         try:
-            return json.loads(e.read().decode("utf-8"))
-        except ValueError:
+            return json.loads(read_body(e, timeout).decode("utf-8"))
+        except (HelperError, ValueError):
             raise HelperError("HTTP %d from %s" % (e.code, url))
+        finally:
+            e.close()
     except (urllib.error.URLError, TimeoutError, ValueError) as e:
         raise HelperError("request to %s failed: %s" % (url, e))
 
@@ -343,9 +385,15 @@ def keys_api(method, fields, timeout=20):
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
+            return resp.status, json.loads(read_body(resp, timeout).decode("utf-8") or "{}")
     except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", "replace")
+        # Callers decide by status, so a body we cannot read is not fatal.
+        try:
+            raw = read_body(e, timeout).decode("utf-8", "replace")
+        except HelperError:
+            raw = ""
+        finally:
+            e.close()
         try:
             return e.code, json.loads(raw)
         except ValueError:

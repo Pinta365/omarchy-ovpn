@@ -12,6 +12,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 # Point the helper at a sandbox before importing it: its state and cache paths
@@ -154,6 +155,67 @@ class ConnectionState(unittest.TestCase):
     def test_nothing_active_is_off(self):
         self.assertEqual(o.vpn_state(None), "off")
         self.assertEqual(o.vpn_state({"GENERAL.STATE": "deactivating"}), "disconnecting")
+
+
+class FakeResponse:
+    """Stands in for an HTTP response: read1 hands back one queued chunk at a
+    time, and b"" is end of body."""
+
+    def __init__(self, chunks, declared=None, delay=0.0, endless=False):
+        self.chunks = list(chunks)
+        self.delay = delay
+        self.endless = endless
+        self.headers = {"Content-Length": str(declared)} if declared is not None else {}
+        if not isinstance(self.headers, dict):
+            self.headers = {}
+        self.headers = type("Headers", (), {"get": lambda _self, k, d=None: (
+            str(declared) if k == "Content-Length" and declared is not None else d)})()
+
+    def read1(self, size):
+        if self.delay:
+            time.sleep(self.delay)
+        if self.chunks:
+            return self.chunks.pop(0)
+        return b" " if self.endless else b""
+
+
+class HttpLimits(unittest.TestCase):
+    """Everything the helper fetches comes from a server it does not control,
+    so a reply may be enormous, cut short, or trickled forever."""
+
+    def test_a_complete_body_is_returned(self):
+        body = b'{"success": true}'
+        self.assertEqual(o.read_body(FakeResponse([body], declared=len(body)), 5), body)
+
+    def test_an_oversized_body_is_refused(self):
+        big = b"x" * 65536
+        chunks = [big] * ((o.MAX_RESPONSE_BYTES // len(big)) + 2)
+        with self.assertRaises(o.HelperError) as caught:
+            o.read_body(FakeResponse(chunks), 5)
+        self.assertIn("more data", str(caught.exception))
+
+    def test_an_oversized_content_length_is_refused_before_reading(self):
+        with self.assertRaises(o.HelperError):
+            o.read_body(FakeResponse([b"x"], declared=o.MAX_RESPONSE_BYTES + 1), 5)
+
+    def test_a_body_cut_short_of_its_content_length_is_refused(self):
+        # read1 does not raise IncompleteRead the way read() does.
+        with self.assertRaises(o.HelperError) as caught:
+            o.read_body(FakeResponse([b"{}"], declared=300), 5)
+        self.assertIn("cut short", str(caught.exception))
+
+    def test_an_endless_trickle_hits_the_deadline(self):
+        started = time.monotonic()
+        with self.assertRaises(o.HelperError) as caught:
+            o.read_body(FakeResponse([], delay=0.02, endless=True), 0.3)
+        self.assertIn("too long", str(caught.exception))
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_a_slow_but_complete_body_is_kept(self):
+        # The deadline must not throw away data already in hand.
+        body = b'{"success": true}'
+        self.assertEqual(
+            o.read_body(FakeResponse([body], declared=len(body), delay=0.35), 0.3), body)
 
 
 class State(unittest.TestCase):
