@@ -840,6 +840,11 @@ def cmd_logout(args):
     emit({"ok": True})
 
 
+def effective_protocol(requested, state):
+    """What was asked for wins; the saved preference is only a fallback."""
+    return requested or state.get("protocol") or "udp"
+
+
 def cmd_connect(args):
 
     # Credentials may arrive on stdin for an account not saved yet; only a
@@ -857,7 +862,7 @@ def cmd_connect(args):
         sys.exit(1)
     remember = bool(data.get("remember")) and bool(data.get("password"))
 
-    proto = args.proto or state.get("protocol") or "udp"
+    proto = effective_protocol(args.proto, state)
     if proto != "wg":
         if not os.path.isfile(NM_OPENVPN_MARKER):
             fail("networkmanager-openvpn is not installed", missingOpenvpn=True)

@@ -139,6 +139,17 @@ class ServerList(unittest.TestCase):
             o.find_datacenter({"datacenters": []}, "nowhere")
 
 
+class ProtocolChoice(unittest.TestCase):
+    def test_the_request_wins_over_the_saved_preference(self):
+        self.assertEqual(o.effective_protocol("wg", {"protocol": "udp"}), "wg")
+
+    def test_the_saved_preference_is_the_fallback(self):
+        self.assertEqual(o.effective_protocol(None, {"protocol": "tcp"}), "tcp")
+
+    def test_a_fresh_install_defaults_to_udp(self):
+        self.assertEqual(o.effective_protocol(None, {}), "udp")
+
+
 class ConnectionState(unittest.TestCase):
     """What the panel believes about the tunnel comes from here."""
 

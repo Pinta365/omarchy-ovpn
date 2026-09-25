@@ -191,7 +191,7 @@ Item {
     }
     if (pendingUsername !== "") payload.username = pendingUsername
     var secret = JSON.stringify(payload)
-    var args = ["connect", target, "--timeout", "45"]
+    var args = ["connect", target, "--proto", protocol, "--timeout", "45"]
     if (multihop) args.push("--via", multihopEntry)
     runAction("connect", args, secret, 60)
   }
@@ -277,7 +277,9 @@ Item {
   }
 
   function setProtocol(proto) {
-    if (proto === protocol || !protocolAllowed(proto)) return
+    // Against the stored preference, not the effective one: the effective one
+    // may already be a fallback, which would make choosing it a no-op.
+    if (proto === status.preferredProtocol || !protocolAllowed(proto)) return
     var s = Object.assign({}, status)
     s.preferredProtocol = proto
     status = s
@@ -358,6 +360,7 @@ Item {
       return
     }
     if (parsed.missingOpenvpn) {
+      lastError = "UDP and TCP need networkmanager-openvpn. Install it, or choose WireGuard."
       var missing = Object.assign({}, status)
       missing.openvpnSupport = false
       missing.state = Model.STATE_OFF
