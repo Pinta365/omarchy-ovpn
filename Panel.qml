@@ -9,6 +9,7 @@ import "Model.js" as Model
 
 Panel {
   id: root
+  property var navigationOwner: null
   moduleName: "pinta365.ovpn"
   ipcTarget: "ovpn"
   // The IpcHandler below carries the extra methods.
@@ -370,7 +371,7 @@ Panel {
         if (root.pickingEntry) root.pickingEntry = false
         else root.close()
       }
-      onTabRequested: function (direction) { root.switchPanel(direction) }
+      onTabRequested: function (direction) { (root.navigationOwner || root).switchPanel(direction) }
       onTextKey: function (t) {
         if (t === "/") { searchField.forceActiveFocus(); return }
         var key = t.toLowerCase()

@@ -72,4 +72,4 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed qt6-declarative
           /usr/lib/qt6/bin/qmllint --version
-          /usr/lib/qt6/bin/qmllint Panel.qml Service.qml ShieldIcon.qml Spinner.qml
+          /usr/lib/qt6/bin/qmllint Widget.qml ProfilesPanel.qml Panel.qml Service.qml ShieldIcon.qml Spinner.qml

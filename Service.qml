@@ -12,7 +12,21 @@ Item {
   // Pushed in by the widgets.
   property var settings: ({})
   property bool settingsReady: false
-  onSettingsChanged: settingsReady = true
+  readonly property bool profileMode: settings.backend === "OpenVPN profiles"
+  onSettingsChanged: {
+    settingsReady = true
+    if (profileMode) {
+      watchProcess.running = false
+      serversProcess.running = false
+      pingProcess.running = false
+      ipProcess.running = false
+      watchRestart.stop()
+    } else {
+      loadServers(false)
+      ping()
+      startWatch()
+    }
+  }
   property int openPanels: 0
   readonly property bool panelOpen: openPanels > 0
 
@@ -110,24 +124,28 @@ Item {
   }
 
   function loadServers(refresh) {
+    if (!settingsReady || profileMode) return
     if (serversProcess.running) return
     serversProcess.command = commandFor(refresh ? ["servers", "--refresh"] : ["servers"])
     serversProcess.running = true
   }
 
   function ping() {
+    if (!settingsReady || profileMode) return
     if (pingProcess.running) return
     pingProcess.command = commandFor(["ping"], 15)
     pingProcess.running = true
   }
 
   function lookupIp() {
+    if (!settingsReady || profileMode) return
     if (ipProcess.running) return
     ipProcess.command = commandFor(["status", "--ip"], 15)
     ipProcess.running = true
   }
 
   function startWatch() {
+    if (!settingsReady || profileMode) return
     if (watchProcess.running) return
     watchProcess.command = ["/usr/bin/python3", helperPath, "watch"]
     watchProcess.running = true
@@ -162,6 +180,7 @@ Item {
   }
 
   function connectTo(slug) {
+    if (profileMode || !settingsReady) return
     if (actionProcess.running) { verifying = false; return }
     var target = resolveTarget(slug, multihopEntry)
     if (target === "") { verifying = false; lastError = "No locations loaded yet"; return }
@@ -321,6 +340,7 @@ Item {
   }
 
   function maybeAutoConnect() {
+    if (profileMode || !settingsReady) return
     if (autoConnectDone || !everLoaded || !settingsReady || locations.length === 0) return
     autoConnectDone = true
     if (!autoConnect || state !== Model.STATE_OFF || !canConnect) return
@@ -387,9 +407,7 @@ Item {
   }
 
   Component.onCompleted: {
-    loadServers(false)
-    ping()
-    startWatch()
+    // Wait for widget settings before contacting a provider.
   }
 
   Process {

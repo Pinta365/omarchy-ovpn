@@ -35,6 +35,38 @@ kernel and NetworkManager already handle it. Everything else it uses
 (NetworkManager, `gnome-keyring`, `libsecret`, `python-gobject`, `iputils`,
 `openssl`) ships with Omarchy.
 
+## Your own OpenVPN profiles
+
+OVPN.com remains the default backend. To manage a work VPN or another
+provider instead, select **OpenVPN profiles** in the widget's **VPN backend**
+setting, or run:
+
+```bash
+omarchy bar set pinta365.ovpn backend "OpenVPN profiles"
+```
+
+This mode does not require an OVPN.com account, fetch its server list, ping
+its locations, or auto-connect. Click the shield, choose **Import .ovpn**, and
+select your configuration. Existing NetworkManager OpenVPN profiles appear
+as well; other VPN protocols are excluded.
+
+Each profile has **Connect** and **Disconnect** buttons. Leave the credentials
+empty for certificates or saved credentials; otherwise enter your username
+and password. An explicitly entered username is saved in the profile, while
+the password is passed to nmcli over stdin, never stored by this plugin or
+placed in argv. NetworkManager's existing profile secret policy still applies.
+Other active tunnels remain connected. Routes, certificates and DNS follow
+the imported profile. Advanced settings can be edited with NetworkManager's
+connection editor. Importing does not activate the profile.
+
+The standalone helper supports `list`, `import PATH`, `connect UUID` (one
+JSON credentials line on stdin) and `disconnect UUID`:
+
+```bash
+python3 helper/openvpn_profiles.py list
+python3 helper/openvpn_profiles.py import /path/to/work.ovpn
+```
+
 ## Remove
 
 ```bash

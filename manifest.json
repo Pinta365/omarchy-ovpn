@@ -11,7 +11,7 @@
     "service"
   ],
   "entryPoints": {
-    "barWidget": "Panel.qml",
+    "barWidget": "Widget.qml",
     "service": "Service.qml"
   },
   "barWidget": {
@@ -25,9 +25,21 @@
       "autoConnect": false,
       "autoConnectTarget": "Last used",
       "notifyOnDrop": true,
-      "pingIntervalSec": 60
+      "pingIntervalSec": 60,
+      "backend": "OVPN.com"
     },
     "schema": [
+      {
+        "key": "backend",
+        "type": "enum",
+        "label": "VPN backend",
+        "options": [
+          "OVPN.com",
+          "OpenVPN profiles"
+        ],
+        "defaultValue": "OVPN.com",
+        "description": "Use OVPN.com locations or your own imported NetworkManager OpenVPN profiles."
+      },
       {
         "key": "showLocationText",
         "type": "boolean",
